@@ -512,7 +512,7 @@ VALUES ({id}, 'failed', 'closed', 'human_close', '{closed_note}');
 |---|---|---|---|---|
 | P1 | scene block 增量策略 | A = 不动 scene block | B = replace_all / C = 先修 bug 再 patch | scene block 自身有 21 行重复段，patch 工具 unique anchor 不可达；design doc 落文件系统已审计可追溯，下次 session 起的 system prompt 通过 project dir read 可发现 → 减法原则穿透 |
 | P2 | JKY Gateway 改造方案 | A = 追加 3 路由到现有 hermes-web-api | B = 独立部署新 bridge gateway / C = JKY Gateway 作为 api-hub provider | 已生产验证方案优先（hermes-web-api 已托管 /jky/* 全路由），不破坏 launch-tracker 链路；零迁移成本；不引入未验证同质替代品（减法三层穿透） |
-| P3 | 项目名最终拍名 | 蓝萌API对接项目（中文） + lanmeng-bridge（英文 slug） | PRD §7.3 候选 lanmonshop-bridge / order-relay / lanmeng-api / 其他 | 中文名锁定业务实体 + 英文 slug 满足代码 / filesystem / Python import / systemd service / DB 路径 / git 仓 6 处统一；"蓝萌"是"蓝盟"在 PRD 落地期间的口语简称（user 拍板 2026-06-26）|
+| P3 | 项目名最终拍名 | 蓝萌API对接项目（中文） + lanmonshop-bridge（英文 slug） | PRD §7.3 候选 lanmonshop-bridge / order-relay / lanmeng-api / 其他 | 中文名锁定业务实体 + 英文 slug 满足代码 / filesystem / Python import / systemd service / DB 路径 / git 仓 6 处统一；"蓝萌"是"蓝盟"在 PRD 落地期间的口语简称（user 拍板 2026-06-26）|
 | P4 | SKU 映射初始化数据来源 | 吉客云 API 每日拉取货品列表存数据库表（每日刷新） | 人工导入 CSV / 商品上传响应 / 中台 getProductList | 中台 skuNo 体系在 jky 商品库一定有映射（业务上 SKU 一定是先在吉客云登记再上中台卖）；每日刷新保证新 SKU 不漏；自动化为默认，人工为审计事件；cron-d 失败 = 飞书 P1 告警 |
 
 ### 11.2 SKU 映射数据源扩展（v0.2 → v0.3 新增 cron-d）
@@ -610,27 +610,28 @@ cron-d: 吉客云货品列表每日拉取 + 刷 sku_mapping
 ### 11.5 项目名工程化映射（Schema-Auditor 一等公民）
 
 中文名: 蓝萌API对接项目
-英文 slug: `lanmeng-bridge`（推荐 ⭐ user 拍板可调整）
+英文 slug: `lanmonshop-bridge`（**1A 拍板沿用 v0.2 候选**，user 2026-06-26）
+- 决策依据：仓名稳定（v0.2 期间已沿用）+ 仓目录物理路径 `~/projects/lanmonshop-bridge/` 不需 rename + 中文 == 英文在 §11.5 表格已标注映射（"蓝萌"为"蓝盟"口语简称，与"蓝盟"业务实体系同一实体，仓目录沿用 PRD v0.2 候选 `lanmonshop-bridge` 保留溯源一致性）
 
 映射表（中文 == 英文 == 仓名 == systemd service == DB 路径 == 飞书群 == git 仓）：
 
 | 维度 | 值 |
 |---|---|
 | 中文项目名 | 蓝萌API对接项目 |
-| 英文 slug | lanmeng-bridge |
-| 本地仓路径 | `~/projects/lanmeng-bridge/`（如重命名则 mv）|
+| 英文 slug | lanmonshop-bridge |
+| 本地仓路径 | `~/projects/lanmonshop-bridge/`（如重命名则 mv）|
 | Python 包名 | `lanmeng_bridge`（import 路径）|
-| systemd service | `lanmeng-bridge.service` |
-| DB 路径 | `~/.hermes/data/lanmeng-bridge.db` |
+| systemd service | `lanmonshop-bridge.service` |
+| DB 路径 | `~/.hermes/data/lanmonshop-bridge.db` |
 | 飞书群 | "蓝萌API对接项目"（中文）|
-| GitHub 仓（待建）| `MinerHo1972/lanmeng-bridge` |
+| GitHub 仓（待建）| `MinerHo1972/lanmonshop-bridge` |
 | 飞书 PRD docx | https://sekqrm4f9b.feishu.cn/docx/W6OpdmoOVorBFdx3RKgcCBn4nhd（v0.2 URL；v0.3 增量同步走 lark-cli）|
 
 ### 11.6 scene block 同步策略（1A 决定）
 
 - 不动 scene block `技术运维-OpenAgents基础设施.md`（1A 拍板）
 - 理由：scene block 自身有 21 行重复段（数据冗余 bug），patch 工具 unique anchor 不可达
-- 取证路径：下次 session 起的 system prompt 注入时，project dir `~/projects/lanmeng-bridge/` read 可发现 docs/future-api-hub.md + 本节 §11 = 完整设计上下文
+- 取证路径：下次 session 起的 system prompt 注入时，project dir `~/projects/lanmonshop-bridge/` read 可发现 docs/future-api-hub.md + 本节 §11 = 完整设计上下文
 
 ### 11.7 触发条件（来自 docs/future-api-hub.md §4）
 
