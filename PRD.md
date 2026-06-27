@@ -207,7 +207,7 @@ init → audited → jky_created → jky_shipped → synced → done
 - **幂等保证** (P1 可行性): order_map.jky_trade_no UNIQUE + state machine 校验（`state IN ['synced','closed']` 不重复回传）+ APScheduler `max_instances=1`
 - **共享逻辑**: 两路径共享 logistic_resolver / sku_resolver / state_machine / notify_feishu，**只 1 份实现**（P10 决定, 拒绝 copy-paste）
 
-### 4.8 webhook 验签算法（D-C, P10 实施细节 — 编码前必须落地）
+### 4.8 webhook 验签算法（D-C, P10 实施细节 — user 2026-06-27 提供 contextid 字段说明）
 
 > 背景：吉客云 webhook (oms.trade.confirm) 推送时附带 D-C 签名串, 我们必须在 handler 第一行验签失败立即 reject, 防伪造请求。
 
@@ -217,7 +217,15 @@ init → audited → jky_created → jky_shipped → synced → done
 签名算法: 去掉sign+contextid > 字典排序k+v拼接 > 首尾加AppSecret > 转小写 > MD5
 ```
 
-**webhook 验签伪代码**（handler 入口）:
+**contextid 字段说明**（user 2026-06-27 提供吉客云开放平台文档）:
+
+| 字段 | 类型 | 必填 | 长度 | 说明 |
+|---|---|---|---|---|
+| `contextid` | String | 否 | 32 | 上下文报文关联ID(**不参与签名**) |
+
+> 关键含义：**contextid 不参与 D-C 签名计算**, 仅用于业务关联追踪（吉客云会回显, 我们审计日志记录）。
+
+**webhook 验签伪代码**（handler 入口, v0.3.6 — 重写重放防御方案）:
 
 ```python
 @app.post("/jky/webhook/oms.trade.confirm")
@@ -225,13 +233,16 @@ async def oms_trade_confirm(request: Request):
     body = await request.body()
     payload = json.loads(body)
     
-    # 1. 提取签名与上下文
+    # 1. 提取签名（contextid 不参与签名, 仅业务关联用, 可选）
     received_sign = payload.pop("sign", None)
-    received_ctx = payload.pop("contextid", None)
-    if not received_sign or not received_ctx:
-        raise HTTPException(401, "missing sign/contextid")
+    received_ctx = payload.pop("contextid", None)  # 可选, 不参与验签
+    if not received_sign:
+        raise HTTPException(401, "missing sign")
     
-    # 2. 验签字段 = payload 中除 sign/contextid 外所有字段
+    # 2. 验签字段 = payload 中除 sign 外所有字段（含 contextid, 因它不参与签名）
+    #    注意：contextid 虽然在 payload 里, 但算法本身"去掉sign+contextid",
+    #          所以 contextid 仍从 payload.items() 中排除（避免影响 MD5 计算）
+    #          但我们这里把 contextid 单独 pop 出来, payload 剩下的就是验签字段
     sorted_kv = "".join(f"{k}{v}" for k, v in sorted(payload.items()))
     expected_sign = hashlib.md5(
         (JKY_APP_SECRET + sorted_kv + JKY_APP_SECRET).lower().encode()
@@ -239,24 +250,45 @@ async def oms_trade_confirm(request: Request):
     
     # 3. 比对（常量时间，防 timing attack）
     if not hmac.compare_digest(received_sign.lower(), expected_sign):
+        # 验签失败 = HTTP 401 + 飞书 P1 告警
+        await notify_feishu_p1("webhook验签失败", {
+            "remote_ip": request.client.host,
+            "payload摘要": {k: str(v)[:50] for k, v in payload.items()},  # 不含secret
+            "received_sign_prefix": received_sign[:8] + "...",
+            "contextid": received_ctx,
+        })
         raise HTTPException(401, "invalid signature")
     
-    # 4. 重放防御（5min 窗口）
-    context_ts = extract_timestamp_from_context(received_ctx)  # 吉客云 contextid 编码时间
-    if abs(datetime.now().timestamp() - context_ts) > 300:
-        raise HTTPException(401, "request expired (>5min old)")
+    # 4. 重放防御（user 提供的 contextid 不含时间戳, 改用 tradeNo 业务幂等防重放）
+    #    理由：contextid 不参与签名且非必填, 无法作为重放窗口依据;
+    #          tradeNo 唯一, 已发货订单 state machine 拒绝重复回传, 等同业务级防重放
+    received_trade_no = payload.get("tradeNo")
+    if not received_trade_no:
+        raise HTTPException(400, "missing tradeNo")
     
-    # 5. 幂等（tradeNo UNIQUE + state machine 校验）
-    # ... 业务逻辑 ...
+    # 5. 业务幂等（tradeNo UNIQUE + state machine 校验）
+    if order_exists_and_synced(received_trade_no):
+        # 已是终态, 直接 ack 200 让吉客云停止重试
+        order_status_log.append(
+            order_no=received_trade_no,
+            source="webhook",
+            note=f"重复回传，幂等跳过 (contextid={received_ctx})"
+        )
+        return {"code": 0, "msg": "ok, already synced"}
+    
+    # 6. 业务处理：state machine 推进 + syncOrderExpress 回传
+    await process_oms_trade_confirm(received_trade_no, payload, contextid=received_ctx)
     return {"code": 0, "msg": "ok"}
 ```
 
-**关键约束**:
+**关键约束（v0.3.6 重写）**:
 - **AppSecret 从 credentials.yaml 读取** (P10 拍板路径 = hermes-web-api, 复用现有 JKY secret)
-- **contextid 时间戳格式**: 吉客云文档待查 (TBD); 若 contextid 不含 ts, 改用 payload 自身 ts 字段或加 nonce cache
+- **contextid 不参与 D-C 签名计算**: 算法本身已显式 pop contextid, payload 剩下的字段才进 MD5（与 §4.8 步骤 2 注释对应）
+- **contextid 字段类型 = String, 32 字符, 非必填**: 缺失不报错, 仅作为审计日志关联 ID
+- **重放防御改用 tradeNo 业务幂等**: 因 contextid 不含时间戳, 改用 order_map.jky_trade_no UNIQUE + state machine 校验（终态直接 ack 200, 业务处理走 process_oms_trade_confirm）
 - **验签失败**: HTTP 401 + 飞书 P1 告警（含 remote_ip + payload 摘要, 不含 secret）
-- **验签成功**: 业务逻辑失败 = HTTP 200 (吉客云会重试, 我们靠 cron-b 60min 兜底)
-- **contextid 唯一性**: 加内存 LRU cache (max 10000), 防 5min 内重放
+- **业务失败**: HTTP 200 + 飞书 P0/P1 告警（吉客云不会重试, 我们靠 cron-b 60min 兜底补救）
+- **不在内存 LRU cache contextid**: 因它非必填且无时间戳, 内存 cache 无意义
 
 ### 4.6 物流映射 YAML 配置(`config/logistic.yaml`)
 
