@@ -1,15 +1,20 @@
 # 物流映射 — 吉客云物流编码 → 中台物流编码
-# 一期手工填充，吉客云物流编码清单待查
+#
+# scope 3: 退化为「种子」文件 — 仅含少数常见快递的种子映射 + fallback。
+# 完整映射由 cron-e（scope 4）每日从 jky_logistic_cache 拉取后运营在 Admin 补齐。
+# LogisticResolver.resolve(jky_logistic_code) 先查 logistic_mapping，未命中走 fallback。
+#
 # 格式：jky_logistic_code → {platform_code, platform_name}
 
 logistic_mapping:
-  # 示例（以下为占位，需替换为实际值）：
-  # "SF": { platform_code: "sf", platform_name: "顺丰速运" }
-  # "ZTO": { platform_code: "zt", platform_name: "中通快递" }
-  # "YTO": { platform_code: "yto", platform_name: "圆通速递" }
-  # "STO": { platform_code: "sto", platform_name: "申通快递" }
-  # "YT": { platform_code: "yt", platform_name: "韵达快递" }
-  # "EMS": { platform_code: "ems", platform_name: "EMS" }
+  # 种子条目（运营确认后替换为真实中台编码）
+  "SF": { platform_code: "sf", platform_name: "顺丰速运" }
+  "ZTO": { platform_code: "zto", platform_name: "中通快递" }
+  "YTO": { platform_code: "yto", platform_name: "圆通速递" }
+  "STO": { platform_code: "sto", platform_name: "申通快递" }
+  "YT": { platform_code: "yt", platform_name: "韵达快递" }
+  "EMS": { platform_code: "ems", platform_name: "EMS" }
+  "JD": { platform_code: "jd", platform_name: "京东物流" }
 
 # 兜底处理：未匹配的物流公司
 fallback:

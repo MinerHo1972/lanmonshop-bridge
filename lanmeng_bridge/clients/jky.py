@@ -57,6 +57,10 @@ class JkyClient:
         """搜索货品"""
         return await self._post("/jky/goods/list", biz)
 
+    async def logistic_list(self, biz: dict) -> dict:
+        """查询物流公司列表（cron-e / scope 3 bootstrap）"""
+        return await self._post("/jky/logistic/list", biz)
+
     async def close(self):
         await self._client.aclose()
 

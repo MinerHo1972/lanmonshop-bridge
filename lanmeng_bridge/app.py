@@ -4,21 +4,25 @@
 """
 
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 
 from .clients.jky import create_jky_client, JkyClient
 from .clients.lanmonshop import create_lanmong_client, LanmongClient
 from .config import load_settings
 from .core.logistic_resolver import LogisticResolver
 from .core.sku_resolver import SkuResolver
+from .core.state_machine import transition, STATE_JKY_SHIPPED, STATE_SYNCED, STATE_DONE
 from .cron import cron_a, cron_b, cron_c, cron_d, cron_e, cron_f
 from .notify.feishu import FeishuNotifier
-from .storage.db import init_db, close_all
+from .storage.db import init_db, close_all, get_connection
 
 # ---------- 日志 ----------
 
@@ -187,6 +191,21 @@ async def lifespan(app: FastAPI):
         f"cron-f(每天 {f_hour:02d}:{f_minute:02d})"
     )
 
+    # ---------- cron-d/e bootstrap（scope 3）----------
+    # 启动时若 jky_product_cache / jky_logistic_cache 为空，主动拉 1 次
+    try:
+        _conn = get_connection()
+        _prod_cnt = _conn.execute("SELECT COUNT(*) FROM jky_product_cache").fetchone()[0]
+        _log_cnt = _conn.execute("SELECT COUNT(*) FROM jky_logistic_cache").fetchone()[0]
+        if _prod_cnt == 0:
+            logger.info("[bootstrap] jky_product_cache 为空，立即拉取货品列表")
+            asyncio.create_task(cron_d.run_cron_d(jky_client, notifier))
+        if _log_cnt == 0:
+            logger.info("[bootstrap] jky_logistic_cache 为空，立即拉取物流公司列表")
+            asyncio.create_task(_bootstrap_logistic_cache(jky_client, notifier))
+    except Exception as e:
+        logger.warning(f"[bootstrap] 拉取失败（非致命）: {e}")
+
     yield  # 应用运行中
 
     # 清理
@@ -231,6 +250,187 @@ async def root():
             "cron_f": "三方状态对账 (03:30, scope 4 实施)",
         },
     }
+
+
+# ---------- webhook（scope 3 §4.8）----------
+
+
+def _jky_webhook_sign(params: dict, app_secret: str) -> str:
+    """吉客云 webhook D-C 验签（与 jky_gateway.jky_sign 完全一致）
+
+    sign_str = (app_secret + concat_sorted_kv + app_secret).lower()
+    expected = md5(sign_str).hexdigest()   # 小写 hex（注意：非 upper）
+    excluded: sign, contextid
+    """
+    filtered = {
+        k: v for k, v in params.items()
+        if k not in ("sign", "contextid") and v is not None
+    }
+    concat = "".join(f"{k}{filtered[k]}" for k in sorted(filtered))
+    raw = f"{app_secret}{concat}{app_secret}".lower()
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def _get_jky_app_secret() -> str:
+    """从 credentials 读取吉客云 AppSecret（webhook 验签用）"""
+    return settings.get("_credentials", {}).get("jky_gateway", {}).get("app_secret", "")
+
+
+async def _bootstrap_logistic_cache(jky: JkyClient, notifier: FeishuNotifier) -> None:
+    """scope 3 bootstrap: 启动时拉取物流公司列表填充 jky_logistic_cache
+
+    （cron-e 的完整 soft-delete + diff-INSERT + 审计算法属 scope 4；
+    此处仅做启动期首填，保证 logistic_resolver 有基础数据。）
+    """
+    try:
+        resp = await jky.logistic_list({"pageIndex": 0, "pageSize": 200})
+    except Exception as e:
+        logger.error(f"[bootstrap-logistic] 拉取失败: {e}")
+        return
+    if resp.get("code") != 0:
+        logger.warning(f"[bootstrap-logistic] JKY 返回异常: {resp.get('msg')}")
+        return
+    data = resp.get("data", {})
+    if isinstance(data, dict):
+        items = data.get("list", data.get("rows", []))
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = []
+    conn = get_connection()
+    try:
+        for it in items:
+            no = (
+                it.get("logisticNo") or it.get("code")
+                or it.get("logisticCompanyCode") or it.get("codeValue") or ""
+            )
+            name = (
+                it.get("logisticName") or it.get("name")
+                or it.get("logisticCompanyName") or it.get("codeName") or ""
+            )
+            if not no:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO jky_logistic_cache "
+                "(jky_logistic_no, jky_logistic_name, raw_json, fetched_at) "
+                "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                (str(no), str(name), json.dumps(it, ensure_ascii=False)),
+            )
+        conn.commit()
+        logger.info(f"[bootstrap-logistic] jky_logistic_cache 填充 {len(items)} 条")
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"[bootstrap-logistic] 写入失败: {e}")
+
+
+async def process_oms_trade_confirm(trade_no: str, payload: dict) -> dict:
+    """处理吉客云 oms.trade.confirm 回调（发货确认）
+
+    scope 3: 状态机推进 + tradeNo 业务幂等 + 审计记录。
+    完整 syncOrderExpress 回传中台由 cron-b (scope 4) 兜底完成。
+    """
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT id, platform_order_no, state FROM order_map WHERE jky_trade_no = ?",
+        (trade_no,),
+    ).fetchone()
+
+    if row is None:
+        # 非本桥创建的订单 — ack 但不处理
+        logger.info(f"[webhook] {trade_no} 非本桥订单，ack 跳过")
+        return {"ack": True, "action": "not_tracked"}
+
+    map_id = row["id"]
+    current_state = row["state"]
+
+    # 已 synced/done = 幂等 ack（不重复回传）
+    if current_state in (STATE_SYNCED, STATE_DONE):
+        logger.info(f"[webhook] {trade_no} 已处理（{current_state}），幂等 ack")
+        return {"ack": True, "action": "idempotent_skip"}
+
+    # 更新物流单号（如有）
+    express_no = payload.get("mainPostid") or payload.get("expressNo") or ""
+    logistic_name = payload.get("logisticName") or payload.get("expressName") or ""
+    if express_no:
+        conn.execute(
+            "UPDATE order_map SET logistic_no = ?, last_attempt_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?",
+            (express_no, map_id),
+        )
+        conn.commit()
+
+    # 状态机推进 → jky_shipped（发货回传 syncOrderExpress 由 cron-b 兜底）
+    if current_state in ("jky_created", "failed", "audited"):
+        transition(map_id, STATE_JKY_SHIPPED, "webhook")
+        logger.info(
+            f"[webhook] {trade_no} → jky_shipped "
+            f"(express={express_no}, {logistic_name}); syncOrderExpress 由 cron-b 兜底"
+        )
+    else:
+        # 其它态记录事件即可
+        conn.execute(
+            "INSERT INTO order_status_log (order_map_id, from_state, to_state, source, error) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (map_id, current_state, current_state, "webhook",
+             json.dumps({"tradeNo": trade_no, "expressNo": express_no}, ensure_ascii=False)),
+        )
+        conn.commit()
+
+    return {"ack": True, "action": "processed", "state": "jky_shipped"}
+
+
+@app.post("/jky/webhook/oms.trade.confirm")
+async def jky_webhook_oms_trade_confirm(request: Request):
+    """吉客云 webhook — 订单发货确认回调（scope 3 §4.8）
+
+    5 步：① 取 sign ② 排除 sign/contextid ③ D-C 验签 ④ tradeNo 业务幂等 ⑤ process_oms_trade_confirm
+    """
+    app_secret = _get_jky_app_secret()
+    if not app_secret:
+        logger.error("[webhook] AppSecret 未配置，拒绝回调")
+        raise HTTPException(status_code=503, detail="webhook secret not configured")
+
+    # 解析参数（query + json/form body，兼容吉客云 TOP 回调）
+    params: dict = {}
+    try:
+        params.update(dict(request.query_params))
+        body = await request.body()
+        if body:
+            try:
+                params.update(json.loads(body))
+            except Exception:
+                from urllib.parse import parse_qs
+                for k, v in parse_qs(body.decode("utf-8", "replace")).items():
+                    params[k] = v[0] if len(v) == 1 else v
+    except Exception as e:
+        logger.warning(f"[webhook] 解析失败: {e}")
+        raise HTTPException(status_code=400, detail="bad request")
+
+    received_sign = str(params.pop("sign", "") or "")
+    if not received_sign:
+        raise HTTPException(status_code=401, detail="missing sign")
+
+    # §4.8 验签
+    expected_sign = _jky_webhook_sign(params, app_secret)
+    if not hmac.compare_digest(expected_sign, received_sign):
+        logger.warning(
+            f"[webhook] 验签失败 (expected={expected_sign[:8]}... got={received_sign[:8]}...)"
+        )
+        raise HTTPException(status_code=401, detail="sign mismatch")
+
+    # tradeNo 业务幂等 + 处理
+    trade_no = str(params.get("tradeNo") or params.get("trade_no") or "")
+    if not trade_no:
+        return {"code": 0, "msg": "ok (no tradeNo)"}
+
+    try:
+        result = await process_oms_trade_confirm(trade_no, params)
+    except Exception as e:
+        logger.exception(f"[webhook] {trade_no} 处理异常: {e}")
+        # 不阻塞吉客云重试 → 200 但标记 error
+        return {"code": -1, "msg": str(e)}
+
+    return {"code": 0, "msg": "ok", "data": result}
 
 
 # ---------- 入口 ----------
