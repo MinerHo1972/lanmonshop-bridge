@@ -24,11 +24,11 @@
 
 ## 2. 解决方案
 
-**单 Python FastAPI 服务 + APScheduler 5 cron + SQLite 7 表 + 异常 SOP**（user 2026-06-26/27 拍板固化）:
+**单 Python FastAPI 服务 + APScheduler 6 cron + SQLite 8 表 + 异常 SOP**（user 2026-06-26/27 拍板固化）:
 
 - **cron-a (5min)**:中台 → 吉客云(`getDeliverOrders` 拉单 → 自动过审 → 创吉客云单 + 审核)
 - **cron-b (60min 兜底, P1 修正)**:吉客云 → 中台（路径 A 主动 poll 拉已发货 → 拿物流单号 → `syncOrderExpress` 回传；user 2026-06-26 拍板 = 主路径已切到 webhook 实时, 本 cron 改 60min 兜底 = 防 callback 丢失 + 吉客云 API 漏单）
-- 🆕 **webhook 路径 (主路径, P10 拍板)**: `oms.trade.confirm` 吉客云主动推我们 `/jky/webhook/oms.trade.confirm` → 验签 (按 user 给 D-C 算法) → 调中台 `syncOrderExpress` 回传（秒级实时）**落地到 hermes-web-api**（与 cron-b 同服务, 共享 D-C 验签密钥 + state machine）
+- 🆕 **webhook 路径 (主路径, P10 拍板)**: `oms.trade.confirm` 吉客云主动推我们 `/jky/webhook/oms.trade.confirm` → 验签 (按 user 给 D-C 算法) → 调中台 `syncOrderExpress` 回传（秒级实时）**落地到 hermes-web-api**（与 cron-b 同服务, 共享 D-C 验签密钥 + state machine）。验签算法详见 §4.8。
 - 🆕 **cron-c (5min)**:对账扫"中台已退但吉客云未退"孤儿单 → 调吉客云 `oms.trade.ordercancel`；已发货订单触发 = P0 资损告警（走售后流程，不静默重试）
 - 🆕 **cron-d (1/day @ 02:00 CST)**:吉客云货品列表每日拉取, request body 带 `category IN ["饮料", "周边"]` (P9), 全量刷新 `jky_product_cache` 表 + 增量同步 `sku_mapping`
 - 🆕 **cron-e (1/day @ 02:30 CST, P1 错峰修正)**:吉客云物流公司列表每日拉取, 全量刷新 `jky_logistic_cache` 表
@@ -207,6 +207,57 @@ init → audited → jky_created → jky_shipped → synced → done
 - **幂等保证** (P1 可行性): order_map.jky_trade_no UNIQUE + state machine 校验（`state IN ['synced','closed']` 不重复回传）+ APScheduler `max_instances=1`
 - **共享逻辑**: 两路径共享 logistic_resolver / sku_resolver / state_machine / notify_feishu，**只 1 份实现**（P10 决定, 拒绝 copy-paste）
 
+### 4.8 webhook 验签算法（D-C, P10 实施细节 — 编码前必须落地）
+
+> 背景：吉客云 webhook (oms.trade.confirm) 推送时附带 D-C 签名串, 我们必须在 handler 第一行验签失败立即 reject, 防伪造请求。
+
+**D-C 签名算法**（与 JKY `oms.*` API 验签一致, 见 credentials.yaml.jky.sign_algorithm）:
+
+```
+签名算法: 去掉sign+contextid > 字典排序k+v拼接 > 首尾加AppSecret > 转小写 > MD5
+```
+
+**webhook 验签伪代码**（handler 入口）:
+
+```python
+@app.post("/jky/webhook/oms.trade.confirm")
+async def oms_trade_confirm(request: Request):
+    body = await request.body()
+    payload = json.loads(body)
+    
+    # 1. 提取签名与上下文
+    received_sign = payload.pop("sign", None)
+    received_ctx = payload.pop("contextid", None)
+    if not received_sign or not received_ctx:
+        raise HTTPException(401, "missing sign/contextid")
+    
+    # 2. 验签字段 = payload 中除 sign/contextid 外所有字段
+    sorted_kv = "".join(f"{k}{v}" for k, v in sorted(payload.items()))
+    expected_sign = hashlib.md5(
+        (JKY_APP_SECRET + sorted_kv + JKY_APP_SECRET).lower().encode()
+    ).hexdigest()
+    
+    # 3. 比对（常量时间，防 timing attack）
+    if not hmac.compare_digest(received_sign.lower(), expected_sign):
+        raise HTTPException(401, "invalid signature")
+    
+    # 4. 重放防御（5min 窗口）
+    context_ts = extract_timestamp_from_context(received_ctx)  # 吉客云 contextid 编码时间
+    if abs(datetime.now().timestamp() - context_ts) > 300:
+        raise HTTPException(401, "request expired (>5min old)")
+    
+    # 5. 幂等（tradeNo UNIQUE + state machine 校验）
+    # ... 业务逻辑 ...
+    return {"code": 0, "msg": "ok"}
+```
+
+**关键约束**:
+- **AppSecret 从 credentials.yaml 读取** (P10 拍板路径 = hermes-web-api, 复用现有 JKY secret)
+- **contextid 时间戳格式**: 吉客云文档待查 (TBD); 若 contextid 不含 ts, 改用 payload 自身 ts 字段或加 nonce cache
+- **验签失败**: HTTP 401 + 飞书 P1 告警（含 remote_ip + payload 摘要, 不含 secret）
+- **验签成功**: 业务逻辑失败 = HTTP 200 (吉客云会重试, 我们靠 cron-b 60min 兜底)
+- **contextid 唯一性**: 加内存 LRU cache (max 10000), 防 5min 内重放
+
 ### 4.6 物流映射 YAML 配置(`config/logistic.yaml`)
 
 ```yaml
@@ -236,7 +287,7 @@ logistic_mapping:
 | 过审 | 中台 `POST /open/v1/order/reviewOrder` | appKey + sign | cron-a 内部 | 服务 | result=0 |
 | 创吉客云单 | JKY `POST /jky/trade/create`(待新增路由) | token | cron-a 内部 | 服务 | `oms.trade.ordercreate` |
 | 审吉客云单 | JKY `POST /jky/trade/audit`(待新增路由) | token | cron-a 内部 | 服务 | `oms.trade.audit.pass` |
-| 拉吉客云已发货 | JKY `POST /jky/trade/list` | token | cron-b 1min | 服务 | modified_time 增量 + state=已发货 |
+| 拉吉客云已发货 | JKY `POST /jky/trade/list` | token | cron-b 60min 兜底 | 服务 | modified_time 增量 + state=已发货 |
 | 回传物流 | 中台 `POST /open/v1/order/syncOrderExpress` | appKey + sign | cron-b 内部 | 服务 | 批量 |
 | 🆕 取消吉客云单 | JKY `POST /jky/trade/cancel`(待新增路由) | token | cron-c 5min | 服务 | `oms.trade.ordercancel` |
 | 仓库列表(辅助) | 中台 `POST /open/v1/warehouse/getList` | appKey + sign | 启动时缓存 | 服务 | 一次性 |
@@ -590,13 +641,20 @@ cron-d: 吉客云货品列表每日拉取 + 刷 sku_mapping
   频次:    1/day @ 02:00 CST（流量低谷，避 00:00-01:00 日切）
   API:     JKY POST /jky/goods/list（scope 3 新增路由 = D1 实施工作量 +1）→ method = `erp-goods.goods.sku.search`（user 2026-06-26 拍板修正 PRD 推测 `oms.goods.query`）
   筛选:    🆕 P9 — request body 带 `category IN ["饮料", "周边"]`（request 级筛选，client 不再过滤；预期入库记录数 ≈ 几百行）
-  数据源:  jky_product_cache 全量刷新（TRUNCATE + INSERT in transaction，限定 P9 筛选后行）
-          sku_mapping 表增量同步（新增 jky_goods_no + 检测已下架 SKU）
+  数据源:  🆕 P1 审计修正 — soft-delete + diff-INSERT 算法（详见 §11.2.8）：
+          1) SELECT 当前所有 jky_goods_no + jky_category（from jky_product_cache）
+          2) 拉新全量（带 category 筛选）
+          3) diff：旧有-新增 = DELETE（写 jky_product_cache_changes）
+                  新增-旧有 = INSERT（写 jky_product_cache + changes）
+                  新增∩旧有 = 比较 jky_price/stock UPDATE（写 changes）
+          4) raw_json 同时保存到主表+changes 表（审计完整）
+  sku_mapping: 增量同步（新增 jky_goods_no + 检测已下架 SKU）
   失败:    自动重试 1 次（5min 后）→ 仍失败 → 飞书 P1 告警
   成功:    不告警（heartbeat 写 log 即可）
   影响:    SKU 映射 jky 端 SSoT = jky_product_cache.jky_goods_no
           业务 cron-a 用 sku_mapping 时如发现 jky_goods_no 已下架 → 标 stale + 飞书 P2 告警
   验证:    scope 5 — 拉取后 SELECT COUNT(*) GROUP BY jky_category 必须两行（饮料 + 周边）且数值稳定在几百
+           + SELECT COUNT(*) FROM jky_product_cache_changes WHERE changed_at > DATE('now', '-1 day') 应 > 0（diff 在工作）
 ```
 
 #### 11.2.4 scripts/init_sku_mapping.py 调整
@@ -632,11 +690,13 @@ CREATE INDEX idx_jky_logistic_fetched ON jky_logistic_cache(fetched_at);
 cron-e: 吉客云物流公司列表每日拉取
   频次:    1/day @ 02:30 CST（与 cron-d 错峰 30min, 防 SQLite 写锁碰撞）
   API:     JKY POST /jky/logistic/list（scope 3 新增路由）→ method = `erp.logistic.get`（P5 验证已订阅）
-  数据源:  jky_logistic_cache 全量刷新（TRUNCATE + INSERT in transaction）
+  数据源:  🆕 P1 审计修正 — 同 cron-d soft-delete + diff-INSERT 算法（详见 §11.2.8）：
+          jky_logistic_cache 主表 + jky_logistic_cache_changes 审计表同时写
   失败:    自动重试 1 次（5min 后）→ 仍失败 → 飞书 P1 告警
   成功:    不告警（heartbeat 写 log 即可）
   影响:    cron-b 物流匹配 jky 端 SSoT = jky_logistic_cache.jky_logistic_no（<24h 时延）
   验证:    scope 5 — 拉取后 SELECT COUNT(*) 行数稳定在几十~几百（吉客云物流公司总数 <200）
+           + SELECT COUNT(*) FROM jky_logistic_cache_changes WHERE changed_at > DATE('now', '-1 day') 应 > 0
 ```
 
 #### 11.2.8 🆕 P1 审计修正 — 新增 cache_changes 审计表
