@@ -27,6 +27,11 @@ cron:
   b_interval_minutes: 60     # 吉客云 → 中台（兜底）
   c_interval_minutes: 5      # 中台退 → 吉客云取消
   d_hour: 2                  # 每日凌晨 2:00 拉货品列表
+  d_minute: 0
+  e_hour: 2                  # 🆕 P5: 每日 02:30 拉物流公司列表（与 cron-d 错峰 30min 防 SQLite 写锁）
+  e_minute: 30
+  f_hour: 3                  # 🆕 三方对账（与 cron-e 错峰 60min）
+  f_minute: 30
 
 # 飞书告警
 feishu:

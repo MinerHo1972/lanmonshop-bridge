@@ -16,7 +16,7 @@ from .clients.lanmonshop import create_lanmong_client, LanmongClient
 from .config import load_settings
 from .core.logistic_resolver import LogisticResolver
 from .core.sku_resolver import SkuResolver
-from .cron import cron_a, cron_b, cron_c, cron_d
+from .cron import cron_a, cron_b, cron_c, cron_d, cron_e, cron_f
 from .notify.feishu import FeishuNotifier
 from .storage.db import init_db, close_all
 
@@ -78,6 +78,22 @@ async def _run_cron_d():
         logger.exception(f"[cron-d] 未捕获异常: {e}")
 
 
+async def _run_cron_e():
+    global jky_client, notifier
+    try:
+        await cron_e.run_cron_e(jky_client, notifier)
+    except Exception as e:
+        logger.exception(f"[cron-e] 未捕获异常: {e}")
+
+
+async def _run_cron_f():
+    global lanmong_client, jky_client, notifier
+    try:
+        await cron_f.run_cron_f(lanmong_client, jky_client, notifier)
+    except Exception as e:
+        logger.exception(f"[cron-f] 未捕获异常: {e}")
+
+
 # ---------- 生命周期 ----------
 
 
@@ -108,35 +124,67 @@ async def lifespan(app: FastAPI):
         logger.warning("飞书 webhook 未配置，告警功能不可用")
 
     # 注册 cron 任务
+    # 并发约束 (PRD §2 P1 可行性修正): APScheduler max_instances=1 + SQLite WAL
+    # 防止 cron-a/b/c/d/e/f 同 order 写锁碰撞 + 同订单被并发处理
     cron_cfg = settings.get("cron", {})
     a_interval = cron_cfg.get("a_interval_minutes", 5)
     b_interval = cron_cfg.get("b_interval_minutes", 60)
     c_interval = cron_cfg.get("c_interval_minutes", 5)
     d_hour = cron_cfg.get("d_hour", 2)
+    d_minute = cron_cfg.get("d_minute", 0)
+    e_hour = cron_cfg.get("e_hour", 2)
+    e_minute = cron_cfg.get("e_minute", 30)
+    f_hour = cron_cfg.get("f_hour", 3)
+    f_minute = cron_cfg.get("f_minute", 30)
+
+    # 通用调度参数: max_instances=1 防止同 cron 重叠, misfire_grace_time + coalesce
+    # 防 ECS 短暂不可用后 job 堆叠
+    common_kwargs = dict(
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
+    )
 
     scheduler.add_job(
         _run_cron_a, "interval", minutes=a_interval,
         id="cron_a", replace_existing=True,
+        **common_kwargs,
     )
     scheduler.add_job(
         _run_cron_b, "interval", minutes=b_interval,
         id="cron_b", replace_existing=True,
+        **common_kwargs,
     )
     scheduler.add_job(
         _run_cron_c, "interval", minutes=c_interval,
         id="cron_c", replace_existing=True,
+        **common_kwargs,
     )
     scheduler.add_job(
-        _run_cron_d, "cron", hour=d_hour, minute=0,
+        _run_cron_d, "cron", hour=d_hour, minute=d_minute,
         id="cron_d", replace_existing=True,
+        **common_kwargs,
+    )
+    scheduler.add_job(
+        _run_cron_e, "cron", hour=e_hour, minute=e_minute,
+        id="cron_e", replace_existing=True,
+        **common_kwargs,
+    )
+    scheduler.add_job(
+        _run_cron_f, "cron", hour=f_hour, minute=f_minute,
+        id="cron_f", replace_existing=True,
+        **common_kwargs,
     )
 
     scheduler.start()
     logger.info(
-        f"Cron 任务已注册: cron-a({a_interval}min), "
+        f"Cron 任务已注册 (max_instances=1): "
+        f"cron-a({a_interval}min), "
         f"cron-b({b_interval}min), "
         f"cron-c({c_interval}min), "
-        f"cron-d(每天 {d_hour}:00)"
+        f"cron-d(每天 {d_hour:02d}:{d_minute:02d}), "
+        f"cron-e(每天 {e_hour:02d}:{e_minute:02d}), "
+        f"cron-f(每天 {f_hour:02d}:{f_minute:02d})"
     )
 
     yield  # 应用运行中
@@ -158,7 +206,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="蓝萌API对接项目",
     description="蓝盟商城中台 ↔ 吉客云 订单中转桥",
-    version="0.3.0",
+    version="0.3.6",
     lifespan=lifespan,
 )
 
@@ -172,12 +220,15 @@ async def health():
 async def root():
     return {
         "service": "lanmonshop-bridge",
-        "version": "0.3.0",
+        "version": "0.3.6",
+        "scope": "scope 2 - 脚手架 + 6 cron 占位 + 8 表 schema",
         "cron": {
-            "cron_a": "中台 → 吉客云",
-            "cron_b": "吉客云 → 中台（兜底）",
-            "cron_c": "中台退 → 吉客云取消",
-            "cron_d": "货品列表每日拉取",
+            "cron_a": "中台 → 吉客云 (5min)",
+            "cron_b": "吉客云 → 中台兜底 (60min)",
+            "cron_c": "中台退 → 吉客云取消 (5min)",
+            "cron_d": "货品列表每日拉取 (02:00)",
+            "cron_e": "物流公司每日拉取 (02:30, scope 4 实施)",
+            "cron_f": "三方状态对账 (03:30, scope 4 实施)",
         },
     }
 

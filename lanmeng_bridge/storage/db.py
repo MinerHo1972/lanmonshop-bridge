@@ -1,4 +1,12 @@
-"""SQLite 持久化 — 4 张表 schema + 连接管理"""
+"""SQLite 持久化 — 8 张表 schema + 连接管理
+
+Scope 2 扩展 (v0.3.6):
+- 新增 jky_logistic_cache (cron-e 维护)
+- 新增 jky_product_cache_changes + jky_logistic_cache_changes (审计即架构, P1 修正)
+- 新增 alert_counter (P2→P1 升级滑动窗口)
+- jky_product_cache 加 jky_category 字段 (P9: 饮料/周边分类)
+- WAL mode + busy_timeout=5000 已就位 (防止 cron-a/c/d/e 写锁碰撞)
+"""
 
 import sqlite3
 import os
@@ -64,19 +72,90 @@ CREATE TABLE IF NOT EXISTS jky_product_cache (
     jky_goods_no TEXT PRIMARY KEY,
     jky_goods_name TEXT,
     jky_barcode TEXT,
-    jky_category_id TEXT,
-    jky_price REAL,
-    jky_stock INTEGER,
-    raw_json TEXT,
-    fetched_at TIMESTAMP,
+    jky_category TEXT,                  -- 🆕 P9: 吉客云分类名（"饮料"/"周边"），运营审计可见
+    jky_category_id TEXT,               -- 吉客云分类 ID（备用, scope 4 可选启用）
+    jky_price REAL,                     -- 吉客云售价（一期不入 ordercreate, 保留）
+    jky_stock INTEGER,                  -- 吉客云库存（一期不入 ordercreate, 保留）
+    raw_json TEXT,                      -- 原始 API 响应（审计即架构）
+    fetched_at TIMESTAMP,               -- 拉取时间（cron-d 监控用）
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_jky_product_barcode ON jky_product_cache(jky_barcode);
+CREATE INDEX IF NOT EXISTS idx_jky_product_category ON jky_product_cache(jky_category);  -- 🆕 P9: 审计/筛选
 CREATE INDEX IF NOT EXISTS idx_jky_product_fetched ON jky_product_cache(fetched_at);
+
+-- 🆕 P5: 吉客云物流公司 cache（cron-e 每日刷新）
+CREATE TABLE IF NOT EXISTS jky_logistic_cache (
+    jky_logistic_no TEXT PRIMARY KEY,   -- 吉客云物流编码（如 "SF_EXPRESS"）
+    jky_logistic_name TEXT,             -- 吉客云物流名（如 "顺丰速运"）
+    raw_json TEXT,                      -- 原始 API 响应（审计即架构）
+    fetched_at TIMESTAMP,               -- 拉取时间（cron-e 监控用）
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_jky_logistic_fetched ON jky_logistic_cache(fetched_at);
+
+-- 🆕 P1 审计修正: cron-d 货品 cache 变更历史表
+CREATE TABLE IF NOT EXISTS jky_product_cache_changes (
+    change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    jky_goods_no TEXT NOT NULL,
+    change_type TEXT,                   -- 'INSERT' / 'DELETE' / 'UPDATE'
+    old_value TEXT,                     -- JSON（变更前快照, DELETE 时为当前值）
+    new_value TEXT,                     -- JSON（变更后快照, DELETE 时为 NULL）
+    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    cron_run_id TEXT                    -- 关联 cron-d run_id（用于追溯第几次拉取）
+);
+CREATE INDEX IF NOT EXISTS idx_jpc_changes_goods ON jky_product_cache_changes(jky_goods_no);
+CREATE INDEX IF NOT EXISTS idx_jpc_changes_time ON jky_product_cache_changes(changed_at);
+
+-- 🆕 P1 审计修正: cron-e 物流 cache 变更历史表
+CREATE TABLE IF NOT EXISTS jky_logistic_cache_changes (
+    change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    jky_logistic_no TEXT NOT NULL,
+    change_type TEXT,                   -- 'INSERT' / 'DELETE' / 'UPDATE'
+    old_value TEXT,
+    new_value TEXT,
+    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    cron_run_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_jlc_changes_logistic ON jky_logistic_cache_changes(jky_logistic_no);
+CREATE INDEX IF NOT EXISTS idx_jlc_changes_time ON jky_logistic_cache_changes(changed_at);
+
+-- 🆕 P2 升级修正: P2→P1 滑动窗口聚合表（按 exception class 聚合）
+CREATE TABLE IF NOT EXISTS alert_counter (
+    exception_class TEXT PRIMARY KEY,   -- e.g. 'JKYRateLimitError' / 'JkyOrderCancelRejectedError'
+    window_start_ts INTEGER NOT NULL,   -- 当前 30min 滑动窗口起点
+    count INTEGER NOT NULL DEFAULT 0,   -- 当前窗口内触发次数
+    last_error TEXT,                    -- 最近一次错误信息（飞书告警附）
+    upgraded_to_p1_at TIMESTAMP         -- 升级 P1 时间（NULL = 未升级; 升级后 1h 内不再降回 P2）
+);
+CREATE INDEX IF NOT EXISTS idx_alert_counter_window ON alert_counter(window_start_ts);
 """
 
-# ---------- Connection Pool ----------
 
+# ---------- 增量迁移（幂等）----------
+
+
+_MIGRATIONS = [
+    # v0.3.6 / P9: jky_product_cache 加 jky_category 字段（已有库 ALTER 加列, 新库走 CREATE TABLE）
+    "ALTER TABLE jky_product_cache ADD COLUMN jky_category TEXT",
+]
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """幂等应用增量迁移 (CREATE TABLE 不会重复建, ADD COLUMN 已存在列会失败被吞)."""
+    for sql in _MIGRATIONS:
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            # "duplicate column name" = 已迁移过, 跳过
+            if "duplicate column" in msg or "already exists" in msg:
+                continue
+            raise
+    conn.commit()
+
+
+# ---------- Connection Pool ----------
 _connections: dict[str, sqlite3.Connection] = {}
 
 
@@ -95,10 +174,15 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: Optional[str] = None):
-    """初始化数据库 schema（幂等）"""
+    """初始化数据库 schema（幂等）
+
+    1. CREATE TABLE IF NOT EXISTS (4 张旧表 + 4 张新表 = 8 张)
+    2. 增量迁移（ALTER TABLE ADD COLUMN，已存在会跳过）
+    """
     conn = get_connection(db_path)
     conn.executescript(SCHEMA_SQL)
     conn.commit()
+    _apply_migrations(conn)
     return conn
 
 
