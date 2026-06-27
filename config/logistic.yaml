@@ -1,0 +1,17 @@
+# 物流映射 — 吉客云物流编码 → 中台物流编码
+# 一期手工填充，吉客云物流编码清单待查
+# 格式：jky_logistic_code → {platform_code, platform_name}
+
+logistic_mapping:
+  # 示例（以下为占位，需替换为实际值）：
+  # "SF": { platform_code: "sf", platform_name: "顺丰速运" }
+  # "ZTO": { platform_code: "zt", platform_name: "中通快递" }
+  # "YTO": { platform_code: "yto", platform_name: "圆通速递" }
+  # "STO": { platform_code: "sto", platform_name: "申通快递" }
+  # "YT": { platform_code: "yt", platform_name: "韵达快递" }
+  # "EMS": { platform_code: "ems", platform_name: "EMS" }
+
+# 兜底处理：未匹配的物流公司
+fallback:
+  platform_code: "unknown"
+  platform_name: "其他快递"

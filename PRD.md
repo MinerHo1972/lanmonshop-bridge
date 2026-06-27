@@ -27,7 +27,8 @@
 **单 Python FastAPI 服务 + APScheduler 3 cron + SQLite 3 表 + 异常 SOP**:
 
 - **cron-a (5min)**:中台 → 吉客云(`getDeliverOrders` 拉单 → 自动过审 → 创吉客云单 + 审核)
-- **cron-b (1min)**:吉客云 → 中台(`/jky/trade/list` 监听已发货 → 拿物流单号 → `syncOrderExpress` 回传)
+- **cron-b (1min → 60min 兜底)**:吉客云 → 中台（路径 A 主动 poll 拉已发货 → 拿物流单号 → `syncOrderExpress` 回传；user 2026-06-26 拍板 = 主路径已切到路径 C 实时 webhook，本 cron 改 60min 兜底 = 防 callback 丢失 + 吉客云 API 漏单）
+- 🆕 **路径 C (webhook callback, 主路径, user 2026-06-26 拍板)**: `oms.trade.confirm` 吉客云主动推我们 `/jky/webhook/oms.trade.confirm` → 验签 (按 user 给 D-C 算法) → 调中台 `syncOrderExpress` 回传（秒级实时）
 - 🆕 **cron-c (5min)**:对账扫"中台已退但吉客云未退"孤儿单 → 调吉客云 `oms.trade.ordercancel`
 - **数据中台化**:3 张表覆盖"订单映射 + 状态审计 + SKU 映射",物流映射走静态 YAML
 - **异常告警**:飞书 webhook 实时推送,所有状态变更全审计,异常按 P0/P1/P2 分级处置
@@ -178,11 +179,18 @@ init → audited → jky_created → jky_shipped → synced → done
 | `remark`(测试开放接口) | `buyerMemo` | 直传 |
 | `state`(1/2/3/4/6/-2/-3/-4) | — | **存到 `order_map.platform_state`(v0.2 新增)**,不进吉客云 |
 
-### 4.5 字段映射表 — 发货回传端(吉客云 → 中台)
+### 4.5 字段映射表 — 发货回传端（2 条独立路径，user 2026-06-26 拍板）
+
+> **关键认知**: PRD v0.3 设计 = 我们 cron-b 主动 poll 拉吉客云已发货订单 + 调中台 `syncOrderExpress`；**另有** `oms.trade.confirm` = 吉客云→中台直发 method（中台自己接收，我们**不**参与）。两条路径可任选其一（中台侧决策），我们仅实现路径 A。
+
+**路径 A — 我们做的（cron-b 60min 主动 poll 兜底，user 2026-06-26 拍板 = 主路径已切到路径 C webhook）**
 
 | 吉客云字段 | → 中台字段 | 转换说明 |
 |---|---|---|
-| `tradeNo`(吉客云销售单号) | `orderId`(841) | **order_map 反查** platform_order_id |
+- **路径 A 详情**: cron-b 60min 主动 poll 拉吉客云已发货订单（state=已发货 + mainPostid 非空）→ 调中台 `syncOrderExpress` 回传
+- **路径 B 详情**: `oms.trade.confirm` webhook 由吉客云主动推 `/jky/webhook/oms.trade.confirm` → 我们验签（按 D-C 算法）→ 调中台 `syncOrderExpress` 回传
+- **两条路径优先级**: 路径 B 为主（实时，秒级）+ 路径 A 兜底（防 B 漏单/失败）
+- **冲突解决**: 同一订单可能在两条路径都被处理，**必须幂等** = order_map.jky_trade_no UNIQUE + state machine 校验不重复回传
 | `mainPostid`(物流单号) | `expressNo` | 直传 |
 | `logisticName`(吉客云物流公司名) | `expressName` | 查 `logistic.yaml`(已配项) |
 | `logisticCode`(吉客云物流编码) | `expressCode` | 查 `logistic.yaml` |
@@ -545,8 +553,7 @@ CREATE INDEX idx_jky_product_fetched ON jky_product_cache(fetched_at);
 ```
 cron-d: 吉客云货品列表每日拉取 + 刷 sku_mapping
   频次:    1/day @ 02:00 CST（流量低谷，避 00:00-01:00 日切）
-  API:     JKY POST /jky/goods/list（scope 3 新增路由 = D1 实施工作量 +1）
-  method:  待 verify = oms.goods.query（吉客云 OTS 订阅 +1）
+  API:     JKY POST /jky/goods/list（scope 3 新增路由 = D1 实施工作量 +1）→ method = `erp-goods.goods.sku.search`（user 2026-06-26 拍板修正 PRD 推测 `oms.goods.query`）
   数据源:  jky_product_cache 全量刷新（TRUNCATE + INSERT in transaction）
           sku_mapping 表增量同步（新增 jky_goods_no + 检测已下架 SKU）
   失败:    自动重试 1 次（5min 后）→ 仍失败 → 飞书 P1 告警
@@ -579,7 +586,8 @@ cron-d: 吉客云货品列表每日拉取 + 刷 sku_mapping
 /jky/trade/create     (oms.trade.ordercreate)
 /jky/trade/audit      (oms.trade.audit.pass)
 /jky/trade/cancel     (oms.trade.ordercancel, v0.2 新增)
-/jky/goods/list       (oms.goods.query, v0.3 cron-d 需要)
+/jky/goods/list        (erp-goods.goods.sku.search, v0.3 cron-d 需要; user 2026-06-26 修正 PRD 推测 oms.goods.query)
+/jky/webhook/oms.trade.confirm (oms.trade.confirm, v0.3 路径 C webhook callback; user 2026-06-26 拍板 = 主路径 + cron-b 60min 兜底)
 ```
 
 #### 11.3.2 实施步骤

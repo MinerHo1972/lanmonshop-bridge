@@ -1,0 +1,42 @@
+# lanmonshop-bridge 配置
+# 凭据从 ~/.hermes/data/credentials.yaml 读取
+
+# 服务
+service:
+  host: "0.0.0.0"
+  port: 18433
+  name: "lanmonshop-bridge"
+
+# 数据库
+db:
+  path: "~/.hermes/data/lanmonshop-bridge.db"
+
+# 蓝盟中台 API
+lanmong:
+  base_url: "https://test-zt-api.lanmonshop.com"
+  # appKey/appSecret 从 credentials.yaml 读取
+
+# 吉客云 Gateway（hermes-web-api 代理路由）
+jky:
+  gateway_url: "http://localhost:8088"
+  # API key 从 credentials.yaml 读取
+
+# Cron 调度
+cron:
+  a_interval_minutes: 5      # 中台 → 吉客云
+  b_interval_minutes: 60     # 吉客云 → 中台（兜底）
+  c_interval_minutes: 5      # 中台退 → 吉客云取消
+  d_hour: 2                  # 每日凌晨 2:00 拉货品列表
+
+# 飞书告警
+feishu:
+  # webhook URL 从 credentials.yaml 读取
+  p0_at_all: true
+
+# 重试策略
+retry:
+  max_attempts: 3
+  backoff_minutes: [1, 5, 15]
+
+# 自动过审开关（默认开启）
+auto_review: true
