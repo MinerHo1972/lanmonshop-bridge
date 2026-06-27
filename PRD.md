@@ -1,7 +1,7 @@
 # 蓝盟中台 ↔ 吉客云 订单中转桥 PRD
 
 |> **项目代号**:`lanmenshop-bridge`（user 2026-06-26 拍板，沿用 v0.2 候选）
-|> **版本**:v0.3.3（2026-06-27，基于 v0.2 + 异常处理 SOP + 中台取消反向同步 + v0.3 5 cron 增量）
+|> **版本**:v0.3.6（2026-06-27，基于 v0.3.5 + ECS 真实基线校正 + 内存假设下修到 ≥800Mi + scope 0 范围明确化）
 |> **范围**:一期 — 订单下载 + 发货回传 + 异常闭环 + SKU/物流 双 cache
 > **来源**:基于《中台对外开放接口 0622(T)》PDF + 吉客云 Gateway `jackyun-api` skill 沉淀 + 本对话 4 轮迭代
 
@@ -461,7 +461,7 @@ sudo systemctl restart hermes-web-api
 
 按依赖顺序:
 
-- [ ] **Step 0**:ECS 8.153.195.8 内存 verify + 4 套服务资源占用基线
+- [ ] **Step 0**（user 2026-06-27 拍板 = 范围修订）:ECS 8.153.195.8 内存 verify（≥800Mi 可用）+ 2 套**本项目相关**服务基线（hermes-web-api:8088 + lanmonshop-bridge:18433 = 当前 121MB；gift-purchase / launch-tracker / flask-mysql / next-server 4 套历史服务不在 scope 0 verify 范围）。v0.3.6 部署后预计 +150Mi，需监控 RSS ≤950Mi 阈值。
 - [ ] **Step 1**:用户申请蓝盟测试环境 appKey + appSecret
 - [ ] **Step 2**:JKY Gateway 新增 6 个路由 `/jky/trade/create` + `/jky/trade/audit` + `/jky/trade/cancel` + `/jky/goods/list` + `/jky/logistic/list` + `/jky/webhook/oms.trade.confirm`(v0.3.4 全集, 沿用 `/jky/trade/list` 风格)
 - [ ] **Step 3**:吉客云开放平台订阅 `oms.trade.ordercreate` + `oms.trade.audit.pass` + `oms.trade.ordercancel`
@@ -830,7 +830,7 @@ cron-f: 三方状态对账（中台 / 吉客云 / DB）
 
 | scope | v0.2 范围 | v0.3 调整 |
 |---|---|---|
-| scope 0 | ECS 内存 + 4 服务资源 verify | 不变 |
+| scope 0 | ECS 内存 + 2 服务资源 verify | **下修内存假设到 ≥800Mi 可用（user 2026-06-27 拍板 B）**——ECS 8.153.195.8 规格 2vCPU/1.8GiB RAM/无 swap，实测 763Mi used / 957Mi available。**scope 0 只看 ECS 2 服务**（user 拍板 B）：hermes-web-api:8088 (60MB) + lanmonshop-bridge:18433 (61MB) = 121MB；WSL 本地的 hermes-gateway + kanban-dashboard 不属 scope 0 范围。其他 ECS 4 套服务（gift-purchase / launch-tracker / flask-mysql / next-server）= 历史包袱，不属本项目 verify 范围。**v0.3.6 部署后预计 +150Mi**（cron-d/e + state_machine + cache_changes）→ 总 ~913Mi / 可用 ~30-70Mi 余量（postgres docker 4-50Mi + nginx 20Mi + argusagent 50Mi 是 ECS 固定开销 = 至少 120Mi 占用）→ **风险：极紧但可控，需 scope 0 监控 free 命令基线 + 准备 OOM 应急 SOP**（非本轮实施，记录到 §11.8）|
 | scope 1 | 蓝盟凭据 + jky OTS 3 method + 物流编码 + ordercancel 范围 | + oms.goods.query 订阅 verify（cron-d 需要）+ erp.logistic.get 订阅 verify（cron-e 需要）|
 | scope 2 | 脚手架（FastAPI + 3 cron + SQLite + state_machine + 异常 SOP）| + 6 cron 占位（cron-d + cron-e + cron-f 新增）|
 | scope 3 | 3 路由改造 + 中台 client + SKU bootstrap + YAML | 5 路由改造（D1=A，+1 = goods/list，+1 = logistic/list，+1 = webhook/oms.trade.confirm）+ 中台 client + SKU 改 cron-d + cron-e 物流 bootstrap + YAML 退化为种子 |
