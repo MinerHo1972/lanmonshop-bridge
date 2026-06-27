@@ -142,14 +142,28 @@ _MIGRATIONS = [
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
-    """幂等应用增量迁移 (CREATE TABLE 不会重复建, ADD COLUMN 已存在列会失败被吞)."""
+    """幂等应用增量迁移。
+
+    兼容两种 DB 状态:
+    - 旧库（v0.3.5 之前）: jky_product_cache 已存在但缺 jky_category → ALTER 成功
+    - 新库（v0.3.6 全新）: jky_product_cache 不存在 → ALTER 失败 "no such table" → 跳过
+      （CREATE TABLE 会在 executescript(SCHEMA_SQL) 时带 jky_category 直接建）
+
+    错误处理:
+    - "duplicate column name" / "already exists" → 已迁移过, 跳过
+    - "no such table" → 全新库, 由 SCHEMA_SQL 建表时带新列, 跳过
+    - 其他 → raise
+    """
     for sql in _MIGRATIONS:
         try:
             conn.execute(sql)
         except sqlite3.OperationalError as e:
             msg = str(e).lower()
-            # "duplicate column name" = 已迁移过, 跳过
-            if "duplicate column" in msg or "already exists" in msg:
+            if (
+                "duplicate column" in msg
+                or "already exists" in msg
+                or "no such table" in msg  # 新库: 表还没建, CREATE TABLE 会带新列
+            ):
                 continue
             raise
     conn.commit()
