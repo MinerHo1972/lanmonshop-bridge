@@ -1,8 +1,8 @@
 # 蓝盟中台 ↔ 吉客云 订单中转桥 PRD
 
-> **项目代号**:`lanmonshop-bridge`(待用户最终拍名)
-> **版本**:v0.2(2026-06-25 草案,基于 v0.1 + 异常处理 SOP + 中台取消反向同步)
-> **范围**:一期 — 仅"订单下载 + 发货回传"2 个接口 + 异常闭环
+|> **项目代号**:`lanmenshop-bridge`（user 2026-06-26 拍板，沿用 v0.2 候选）
+|> **版本**:v0.3.3（2026-06-27，基于 v0.2 + 异常处理 SOP + 中台取消反向同步 + v0.3 5 cron 增量）
+|> **范围**:一期 — 订单下载 + 发货回传 + 异常闭环 + SKU/物流 双 cache
 > **来源**:基于《中台对外开放接口 0622(T)》PDF + 吉客云 Gateway `jackyun-api` skill 沉淀 + 本对话 4 轮迭代
 
 > 🆕 **v0.2 vs v0.1 增量**:
@@ -24,16 +24,19 @@
 
 ## 2. 解决方案
 
-**单 Python FastAPI 服务 + APScheduler 3 cron + SQLite 3 表 + 异常 SOP**:
+**单 Python FastAPI 服务 + APScheduler 5 cron + SQLite 7 表 + 异常 SOP**（user 2026-06-26/27 拍板固化）:
 
 - **cron-a (5min)**:中台 → 吉客云(`getDeliverOrders` 拉单 → 自动过审 → 创吉客云单 + 审核)
-- **cron-b (1min → 60min 兜底)**:吉客云 → 中台（路径 A 主动 poll 拉已发货 → 拿物流单号 → `syncOrderExpress` 回传；user 2026-06-26 拍板 = 主路径已切到路径 C 实时 webhook，本 cron 改 60min 兜底 = 防 callback 丢失 + 吉客云 API 漏单）
-- 🆕 **路径 C (webhook callback, 主路径, user 2026-06-26 拍板)**: `oms.trade.confirm` 吉客云主动推我们 `/jky/webhook/oms.trade.confirm` → 验签 (按 user 给 D-C 算法) → 调中台 `syncOrderExpress` 回传（秒级实时）
-- 🆕 **cron-c (5min)**:对账扫"中台已退但吉客云未退"孤儿单 → 调吉客云 `oms.trade.ordercancel`
-- **数据中台化**:3 张表覆盖"订单映射 + 状态审计 + SKU 映射",物流映射走静态 YAML
+- **cron-b (60min 兜底, P1 修正)**:吉客云 → 中台（路径 A 主动 poll 拉已发货 → 拿物流单号 → `syncOrderExpress` 回传；user 2026-06-26 拍板 = 主路径已切到 webhook 实时, 本 cron 改 60min 兜底 = 防 callback 丢失 + 吉客云 API 漏单）
+- 🆕 **webhook 路径 (主路径, P10 拍板)**: `oms.trade.confirm` 吉客云主动推我们 `/jky/webhook/oms.trade.confirm` → 验签 (按 user 给 D-C 算法) → 调中台 `syncOrderExpress` 回传（秒级实时）**落地到 hermes-web-api**（与 cron-b 同服务, 共享 D-C 验签密钥 + state machine）
+- 🆕 **cron-c (5min)**:对账扫"中台已退但吉客云未退"孤儿单 → 调吉客云 `oms.trade.ordercancel`；已发货订单触发 = P0 资损告警（走售后流程，不静默重试）
+- 🆕 **cron-d (1/day @ 02:00 CST)**:吉客云货品列表每日拉取, request body 带 `category IN ["饮料", "周边"]` (P9), 全量刷新 `jky_product_cache` 表 + 增量同步 `sku_mapping`
+- 🆕 **cron-e (1/day @ 02:30 CST, P1 错峰修正)**:吉客云物流公司列表每日拉取, 全量刷新 `jky_logistic_cache` 表
+- **数据中台化**:7 张表覆盖订单映射 + 状态审计 + SKU/物流双 cache + cache_changes 历史表 (P1 审计修正)
 - **异常告警**:飞书 webhook 实时推送,所有状态变更全审计,异常按 P0/P1/P2 分级处置
 - **吉客云发货流程完全不介入**:我们只创建销售单 + 监听状态,仓库作业由吉客云自有流程完成
 - 🆕 **异常闭环**:异常关闭写入 `order_map.closed_at/closed_by/closed_note`,审计即架构
+- 🆕 **并发约束** (P1 可行性修正): APScheduler `max_instances=1` + SQLite 全局 write lock, 防止 cron-a/c/d/e 写锁碰撞 + 同订单被并发处理
 
 ## 3. 用户故事(User Stories)
 
@@ -85,8 +88,10 @@ lanmonshop-bridge/
 │   └── logistic_resolver.py# 物流映射(YAML 加载)
 ├── cron/
 │   ├── cron_a.py           # 中台 → 吉客云(5min)
-│   ├── cron_b.py           # 吉客云 → 中台(1min)
-│   └── cron_c.py           # 🆕 中台已退 → 吉客云取消(5min,对账)
+│   ├── cron_b.py           # 吉客云 → 中台(60min 兜底, P1 修正)
+│   ├── cron_c.py           # 中台已退 → 吉客云取消(5min,对账; 已发订单 P0 升级)
+│   ├── cron_d.py           # 🆕 吉客云货品 cache(1/day @ 02:00, 仅 饮料/周边 分类)
+│   └── cron_e.py           # 🆕 吉客云物流 cache(1/day @ 02:30 错峰)
 ├── notify/
 │   └── feishu.py           # 飞书告警 webhook (P0/P1/P2 三套模板)
 ├── config/
@@ -129,7 +134,7 @@ CREATE TABLE order_status_log (
   order_map_id INTEGER NOT NULL,
   from_state TEXT,                           -- 前态(NULL = 首次)
   to_state TEXT NOT NULL,                    -- 后态
-  source TEXT NOT NULL,                      -- cron_a / cron_b / cron_c / manual / api / human_close
+  source TEXT NOT NULL,                      -- cron_a / cron_b / cron_c / cron_d / cron_e / cron_f / webhook / manual / api / human_close (v0.3.4 加 webhook + cron_d/e/f)
   error TEXT,                                -- 错误详情(NULL = 正常)
   ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (order_map_id) REFERENCES order_map(id)
@@ -179,24 +184,28 @@ init → audited → jky_created → jky_shipped → synced → done
 | `remark`(测试开放接口) | `buyerMemo` | 直传 |
 | `state`(1/2/3/4/6/-2/-3/-4) | — | **存到 `order_map.platform_state`(v0.2 新增)**,不进吉客云 |
 
-### 4.5 字段映射表 — 发货回传端（2 条独立路径，user 2026-06-26 拍板）
+### 4.5 字段映射表 — 发货回传端（P10 拍板：webhook 主路径 + cron-b 60min 兜底）
 
-> **关键认知**: PRD v0.3 设计 = 我们 cron-b 主动 poll 拉吉客云已发货订单 + 调中台 `syncOrderExpress`；**另有** `oms.trade.confirm` = 吉客云→中台直发 method（中台自己接收，我们**不**参与）。两条路径可任选其一（中台侧决策），我们仅实现路径 A。
+> **关键认知（P10 拍板, user 2026-06-27）**: 我们**两个路径都做**, webhook 是主路径（秒级实时）+ cron-b 是兜底（60min 兜底防漏单）。两条路径都**落地到 hermes-web-api**（同一个 FastAPI 服务, 共享 D-C 验签密钥 + state machine + 中台 client + SQLite 锁）。“我们不参与”的 v0.2 早期语义已废弃。
 
-**路径 A — 我们做的（cron-b 60min 主动 poll 兜底，user 2026-06-26 拍板 = 主路径已切到路径 C webhook）**
+**路径 W（webhook, 主路径, P10 拍板）** — 吉客云 `oms.trade.confirm` 主动推 `/jky/webhook/oms.trade.confirm`：
 
 | 吉客云字段 | → 中台字段 | 转换说明 |
 |---|---|---|
-- **路径 A 详情**: cron-b 60min 主动 poll 拉吉客云已发货订单（state=已发货 + mainPostid 非空）→ 调中台 `syncOrderExpress` 回传
-- **路径 B 详情**: `oms.trade.confirm` webhook 由吉客云主动推 `/jky/webhook/oms.trade.confirm` → 我们验签（按 D-C 算法）→ 调中台 `syncOrderExpress` 回传
-- **两条路径优先级**: 路径 B 为主（实时，秒级）+ 路径 A 兜底（防 B 漏单/失败）
-- **冲突解决**: 同一订单可能在两条路径都被处理，**必须幂等** = order_map.jky_trade_no UNIQUE + state machine 校验不重复回传
+| `tradeNo`(已审核过的吉客云销售单号) | `orderNo` | 直传（order_map 关联）|
 | `mainPostid`(物流单号) | `expressNo` | 直传 |
-| `logisticName`(吉客云物流公司名) | `expressName` | 查 `logistic.yaml`(已配项) |
-| `logisticCode`(吉客云物流编码) | `expressCode` | 查 `logistic.yaml` |
-| `assemblyGoodsDetail[].skuNo` | `orderItems[].skuNo` | **order_map 反查** 中台 skuNo |
-| `assemblyGoodsDetail[].qty` | `orderItems[].num` | 直传 |
-| — | `warehouseId` + `warehouseName` | **中台虚拟仓,默认值待 confirm**(中台不关心实际物理仓) |
+| `logisticName`(吉客云物流公司名) | `expressName` | 查 `jky_logistic_cache`(cron-e 维护) → 命中 → 用物流名 |
+| `logisticCode`(吉客云物流编码) | `expressCode` | 查 `jky_logistic_cache`(cron-e 维护) → 命中 → 用物流编码 |
+
+**路径 A（cron-b 60min 主动 poll 兜底, P1 修正频次）** — 防 webhook 漏单/失败时主动补救:
+
+| 吉客云字段 | → 中台字段 | 转换说明 |
+|---|---|---|
+| 同路径 W 四字段 | 同路径 W | 同路径 W 转换逻辑, 复用 logistic_resolver / sku_resolver |
+
+- **W/A 优先级**: W 主（实时秒级）+ A 兜底（60min 兜底）
+- **幂等保证** (P1 可行性): order_map.jky_trade_no UNIQUE + state machine 校验（`state IN ['synced','closed']` 不重复回传）+ APScheduler `max_instances=1`
+- **共享逻辑**: 两路径共享 logistic_resolver / sku_resolver / state_machine / notify_feishu，**只 1 份实现**（P10 决定, 拒绝 copy-paste）
 
 ### 4.6 物流映射 YAML 配置(`config/logistic.yaml`)
 
@@ -305,11 +314,11 @@ sudo systemctl restart hermes-web-api
 ### 5.3 端到端真验 SOP(部署前必跑)
 
 1. 蓝盟测试环境创建 1 个 toy 订单(state=已支付待审核)
-2. 启服务 → 验证 cron-a/b/c 都注册成功
+2. 启服务 → 验证 cron-a/b/c/d/e 都注册成功
 3. 验证:中台订单 state=2(已自动过审)
 4. 验证:吉客云沙盒有对应销售单(待审核)
 5. 仓库人员手工递交到仓库 → WMS 发货(模拟)
-6. 验证:cron-b 1min 内监听到已发货
+6. 验证:webhook 路径 W 实时触发 syncOrderExpress（秒级）; cron-b 60min 兜底再走一次不重复
 7. 验证:中台订单 state=4(已发货)+ expressNo 已填
 8. 飞书验证:收到 5 条状态变更审计消息(init → audited → jky_created → jky_shipped → synced)
 9. 🆕 异常路径:模拟 SKU 缺映射 → 验证该单跳过 + 飞书 P1 告警 + SQL mark closed → closed_at 写入
@@ -371,7 +380,7 @@ sudo systemctl restart hermes-web-api
 
 - [ ] **Step 0**:ECS 8.153.195.8 内存 verify + 4 套服务资源占用基线
 - [ ] **Step 1**:用户申请蓝盟测试环境 appKey + appSecret
-- [ ] **Step 2**:JKY Gateway 新增 3 个路由 `/jky/trade/create` + `/jky/trade/audit` + `/jky/trade/cancel`(沿用 `/jky/trade/list` 风格)
+- [ ] **Step 2**:JKY Gateway 新增 6 个路由 `/jky/trade/create` + `/jky/trade/audit` + `/jky/trade/cancel` + `/jky/goods/list` + `/jky/logistic/list` + `/jky/webhook/oms.trade.confirm`(v0.3.4 全集, 沿用 `/jky/trade/list` 风格)
 - [ ] **Step 3**:吉客云开放平台订阅 `oms.trade.ordercreate` + `oms.trade.audit.pass` + `oms.trade.ordercancel`
 - [ ] **Step 4**:服务骨架 init(FastAPI + SQLite + 3 cron + state_machine + exception_handler)
 - [ ] **Step 5**:SKU 映射初始化(决策点待 user 拍)
@@ -525,7 +534,7 @@ VALUES ({id}, 'failed', 'closed', 'human_close', '{closed_note}');
 > 本节记录 2026-06-26 飞书 DM 4 项拍板 + 对 scope 计划的影响。
 > PRD v0.2 主体（§1-§9）保持不变；v0.3 仅追加本节，不回填覆盖。
 
-### 11.1 拍板记录（v0.3 — 4 项 2026-06-26 + 4 项 2026-06-27）
+### 11.1 拍板记录（v0.3 — 4 项 2026-06-26 + 6 项 2026-06-27）
 
 #### 11.1.1 2026-06-26 飞书 DM 拍板（4 项）
 
@@ -545,6 +554,7 @@ VALUES ({id}, 'failed', 'closed', 'human_close', '{closed_note}');
 | P7 | 吉客云 OTS 订阅状态 | **3 method 已全部订阅**（user 2026-06-27 验证：oms.trade.ordercreate / oms.trade.audit.pass / oms.trade.ordercancel） | 重新订阅 | PRD §3.1 第 269 行 ⚠️ 排除；无 0130020310 风险；scope 2-5 真验可正常推进 |
 | P8 | 蓝盟凭据策略 | **先用测试密钥跑通端到端流程，正式密钥切换 SOP 暂缓**（user 2026-06-27 拍板） | 立即申请正式密钥 / 测试密钥直接上 PRD v1.0 | 蓝盟 appKey 测试环境（endpoint `https://test-zt-api.lanmonshop.com`）+ 沙箱数据已可验证 scope 0-6 全链路；正式密钥涉及商务+合同，搁置不影响开发节奏；端到端跑通后再启切换 SOP（4 步：正式密钥就位 → credentials.yaml 替换 + 备份测试密钥 → scope 5 真验 → 监控 + 回滚预案）|
 | P9 | cron-d SKU 拉取范围 | **仅拉取 `category IN ["饮料", "周边"]`**（user 2026-06-27 拍板） | 全量拉取 / 拉全部启用商品 / 拉全部分类 | 吉客云实际 SKU 表量大（万级），我们业务只服务饮料 + 周边；筛选后**记录数降至几百行**（user 实证）→ ① jky_product_cache 表小 → TRUNCATE+INSERT 快 ② sku_mapping 增量 diff 更快 ③ API 请求负载小（带 category 筛选参数） ④ 库存/价格字段即使加上也只占小空间；**schema 加 `jky_category` 字段存分类名**（区分 "饮料" / "周边" 两类，运营审计 "为什么这个 SKU 在表里" 一眼可见）|
+| P10 | oms.trade.confirm webhook 接收归属 | **webhook 主路径 + cron-b 60min 兜底，两个路径都做 + 都落地 hermes-web-api**（user 2026-06-27 拍板） | A = 仅 cron-b 主动 poll / B = 仅 webhook / C = 两条都做但落到不同服务 | A 实时性差（最坏 60min 延迟），中台客服/运营体验差；B webhook 单独部署需维护额外服务（验签密钥/路由/state machine），与 cron-b 共享逻辑要 copy-paste；C 在同一服务复用逻辑 = 减法原则 + 共享 D-C 验签密钥 + 共享 state machine + 共享 SQLite 锁；幂等靠 order_map.jky_trade_no UNIQUE + state machine 校验；**拒绝** v0.2 早期"我们不参与"的语义（语义已废弃, 写入 §4.5 关键认知声明）|
 
 ### 11.2 SKU 映射数据源扩展（v0.2 → v0.3 新增 cron-d）
 
@@ -603,6 +613,97 @@ cron-d: 吉客云货品列表每日拉取 + 刷 sku_mapping
   - (B) jky 有但中台未推 → 飞书 P1 告警 + 提示"中台推 SKU"
 - 区分依据：cron-d 拉的 jky_product_cache 中是否含此 platform_barcode
 
+#### 11.2.6 新增表 jky_logistic_cache（吉客云物流公司 cache, P5 实施）— Schema-Auditor 一等公民
+
+```sql
+CREATE TABLE jky_logistic_cache (
+  jky_logistic_no TEXT PRIMARY KEY,   -- 吉客云物流编码（如 "SF_EXPRESS"）
+  jky_logistic_name TEXT,            -- 吉客云物流名（如 "顺丰速运"）
+  raw_json TEXT,                     -- 原始 API 响应（审计即架构）
+  fetched_at TIMESTAMP,              -- 拉取时间（cron-e 监控用）
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_jky_logistic_fetched ON jky_logistic_cache(fetched_at);
+```
+
+#### 11.2.7 新增 cron-e（每日 02:30 CST, P1 错峰修正）
+
+```
+cron-e: 吉客云物流公司列表每日拉取
+  频次:    1/day @ 02:30 CST（与 cron-d 错峰 30min, 防 SQLite 写锁碰撞）
+  API:     JKY POST /jky/logistic/list（scope 3 新增路由）→ method = `erp.logistic.get`（P5 验证已订阅）
+  数据源:  jky_logistic_cache 全量刷新（TRUNCATE + INSERT in transaction）
+  失败:    自动重试 1 次（5min 后）→ 仍失败 → 飞书 P1 告警
+  成功:    不告警（heartbeat 写 log 即可）
+  影响:    cron-b 物流匹配 jky 端 SSoT = jky_logistic_cache.jky_logistic_no（<24h 时延）
+  验证:    scope 5 — 拉取后 SELECT COUNT(*) 行数稳定在几十~几百（吉客云物流公司总数 <200）
+```
+
+#### 11.2.8 🆕 P1 审计修正 — 新增 cache_changes 审计表
+
+> 背景：v0.3 引入 cron-d/e 每日 TRUNCATE+INSERT 两张 cache 表, 销毁历史快照, 违反"审计即架构"一等公民承诺。修正：两张 cache 表**改为软标记 + 归档表**。
+
+```sql
+-- audit 即架构 — 缓存变更历史表（P1 审计修正）
+CREATE TABLE jky_product_cache_changes (
+  change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  jky_goods_no TEXT NOT NULL,
+  change_type TEXT,                  -- 'INSERT' / 'DELETE' / 'UPDATE'
+  old_value TEXT,                    -- JSON（变更前快照，DELETE 时为当前值）
+  new_value TEXT,                    -- JSON（变更后快照，DELETE 时为 NULL）
+  changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  cron_run_id TEXT                   -- 关联 cron-d run_id（用于追溯是第几次拉取）
+);
+CREATE INDEX idx_jpc_changes_goods ON jky_product_cache_changes(jky_goods_no);
+CREATE INDEX idx_jpc_changes_time ON jky_product_cache_changes(changed_at);
+
+CREATE TABLE jky_logistic_cache_changes (
+  change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  jky_logistic_no TEXT NOT NULL,
+  change_type TEXT,                  -- 'INSERT' / 'DELETE' / 'UPDATE'
+  old_value TEXT,
+  new_value TEXT,
+  changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  cron_run_id TEXT
+);
+CREATE INDEX idx_jlc_changes_logistic ON jky_logistic_cache_changes(jky_logistic_no);
+CREATE INDEX idx_jlc_changes_time ON jky_logistic_cache_changes(changed_at);
+
+-- cron-d/e 重构：TRUNCATE → soft-delete + diff-INSERT
+-- 算法：先 SELECT 当前所有 jky_goods_no → 与新拉取对比 → 写 changes 表 → UPDATE/INSERT 主表
+-- 性能影响：~几百行 diff < 1s（实测足以）
+```
+
+#### 11.2.9 🆕 P2 升级修正 — 新增 alert_counter 表
+
+> 背景：§9.2 P2→P1 升级判定"30min 窗口连续 3 次"需要按 exception class 聚合, 但 retry_count 是 per-order, 无聚合表。
+
+```sql
+CREATE TABLE alert_counter (
+  exception_class TEXT PRIMARY KEY,  -- e.g. 'JKYRateLimitError' / 'JkyOrderCancelRejectedError'
+  window_start_ts INTEGER NOT NULL,  -- 当前 30min 滑动窗口起点
+  count INTEGER NOT NULL DEFAULT 0,  -- 当前窗口内触发次数
+  last_error TEXT,                   -- 最近一次错误信息（飞书告警附）
+  upgraded_to_p1_at TIMESTAMP        -- 升级 P1 时间（NULL = 未升级；升级后 1 小时内不再降回 P2）
+);
+CREATE INDEX idx_alert_counter_window ON alert_counter(window_start_ts);
+```
+
+#### 11.2.10 🆕 P1 可测试性修正 — 新增 cron-f 三方对账
+
+> 背景：§9.1 "三方偏差 ≥5 单"列为 P0, 但全文无 cron 负责三方对账。修正：新增 cron-f 每日对账。
+
+```
+cron-f: 三方状态对账（中台 / 吉客云 / DB）
+  频次:    1/day @ 03:30 CST（cron-e 错峰 60min, 防 SQLite 写锁）
+  对账:    SELECT * FROM order_map WHERE state IN ['jky_shipped','synced']
+            → 拉中台 /open/v1/order/getDeliverOrders?orderIds=... 拉吉客云 /jky/trade/list?tradeNos=...
+            → 三方 state 偏差 >5 单 → 飞书 P0 资损告警 + 详情（哪些单偏差）
+            → 偏差 ≤5 单 → 飞书 P2 日志告警（不阻塞）
+  失败:    自动重试 1 次 → 仍失败 → 飞书 P1 告警（cron 自身失败）
+  实施:    scope 4 新增 cron-f（v0.3.4 第 6 个 cron）
+```
+
 ### 11.3 D1=A 影响（JKY Gateway 改造方案 A 拆解）
 
 #### 11.3.1 方案 A 范围
@@ -614,15 +715,18 @@ cron-d: 吉客云货品列表每日拉取 + 刷 sku_mapping
 /jky/trade/audit      (oms.trade.audit.pass)
 /jky/trade/cancel     (oms.trade.ordercancel, v0.2 新增)
 /jky/goods/list        (erp-goods.goods.sku.search, v0.3 cron-d 需要; user 2026-06-26 修正 PRD 推测 oms.goods.query)
-/jky/webhook/oms.trade.confirm (oms.trade.confirm, v0.3 路径 C webhook callback; user 2026-06-26 拍板 = 主路径 + cron-b 60min 兜底)
+/jky/logistic/list     (erp.logistic.get, v0.3 cron-e 需要; P5)
+/jky/webhook/oms.trade.confirm (oms.trade.confirm, v0.3 路径 W webhook 主路径 + cron-b 60min 兜底; P10 拍板 = 都落地 hermes-web-api)
 ```
 
 #### 11.3.2 实施步骤
 
-1. 改 services/jky.py 注册权限 +1 项（oms.goods.query）
-2. 改 main.py 加 1 路由（/jky/goods/list）
+1. 改 services/jky.py 注册权限 +2 项（oms.goods.query + erp.logistic.get）
+2. 改 main.py 加 3 路由（/jky/goods/list + /jky/logistic/list + /jky/webhook/oms.trade.confirm）
 3. 重启 hermes-web-api.service
-4. curl 4 路由验证无 subCode 错误
+4. curl 6 路由验证无 subCode 错误（4 旧 + 2 新 = 创/审/取/取物/取物w + webhook）
+5. 🆕 P10 — webhook 路由共享 D-C 验签密钥 + state machine（与 cron-b 在同一进程，逻辑复用 logistic_resolver/sku_resolver）
+6. 🆕 APScheduler `max_instances=1` + SQLite WAL mode + busy_timeout 防并发
 
 #### 11.3.3 风险
 
@@ -636,11 +740,11 @@ cron-d: 吉客云货品列表每日拉取 + 刷 sku_mapping
 |---|---|---|
 | scope 0 | ECS 内存 + 4 服务资源 verify | 不变 |
 | scope 1 | 蓝盟凭据 + jky OTS 3 method + 物流编码 + ordercancel 范围 | + oms.goods.query 订阅 verify（cron-d 需要）+ erp.logistic.get 订阅 verify（cron-e 需要）|
-| scope 2 | 脚手架（FastAPI + 3 cron + SQLite + state_machine + 异常 SOP）| + 5 cron 占位（cron-d + cron-e 新增）|
-| scope 3 | 3 路由改造 + 中台 client + SKU bootstrap + YAML | 4 路由改造（D1=A，+1 = goods/list）+ 中台 client + SKU 改 cron-d + cron-e 物流 bootstrap + YAML 退化为种子 |
-| scope 4 | 3 cron 业务逻辑 | 5 cron 业务逻辑（cron-d 实施 sku_mapping 增量同步 + cron-e 实施 jky_logistic_cache 全量刷新 + 已发订单 P0 资损路径）|
-| scope 5 | 端到端真验 SOP | + cron-d + cron-e 验证步骤（拉取后 sku_mapping/jky_logistic_cache 完整性）+ 已发订单拒绝路径 verify |
-| scope 6 | 灰度 + 培训 | + cron-e 失败应急 SOP（人工 init_logistic.py 路径培训）+ 已发订单 P0 升级 SOP |
+| scope 2 | 脚手架（FastAPI + 3 cron + SQLite + state_machine + 异常 SOP）| + 6 cron 占位（cron-d + cron-e + cron-f 新增）|
+| scope 3 | 3 路由改造 + 中台 client + SKU bootstrap + YAML | 5 路由改造（D1=A，+1 = goods/list，+1 = logistic/list，+1 = webhook/oms.trade.confirm）+ 中台 client + SKU 改 cron-d + cron-e 物流 bootstrap + YAML 退化为种子 |
+| scope 4 | 3 cron 业务逻辑 | 6 cron 业务逻辑（cron-d 实施 sku_mapping 增量同步 + cron-e 实施 jky_logistic_cache 全量刷新 + cron-f 三方对账 + cache_changes 审计表 + 已发订单 P0 路径 + APScheduler max_instances=1）|
+| scope 5 | 端到端真验 SOP | + cron-d + cron-e + cron-f 验证步骤 + webhook 路径 W 触发验证 + cache_changes 写入 verify + 已发订单拒绝路径 verify |
+| scope 6 | 灰度 + 培训 | + cron-e/f 失败应急 SOP（人工 init_logistic.py 路径培训）+ 已发订单 P0 升级 SOP + alert_counter 滑动窗口培训 |
 
 ### 11.5 项目名工程化映射（Schema-Auditor 一等公民）
 
