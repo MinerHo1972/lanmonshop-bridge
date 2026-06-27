@@ -24,7 +24,8 @@ class LanmongClient:
         self.base_url = base_url.rstrip("/")
         self.app_key = app_key
         self.app_secret = app_secret
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(connect=5, read=20))
+        # httpx >= 0.28 requires either default= or all 4 params explicitly
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(connect=5, read=20, write=20, pool=5))
 
     def _headers(self) -> dict:
         timestamp = str(int(time.time() * 1000))

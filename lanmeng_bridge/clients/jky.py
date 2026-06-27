@@ -13,7 +13,7 @@ class JkyClient:
     def __init__(self, gateway_url: str, api_key: str):
         self.gateway_url = gateway_url.rstrip("/")
         self.api_key = api_key
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(connect=5, read=20))
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(connect=5, read=20, write=20, pool=5))
 
     async def _post(self, path: str, biz: dict) -> dict:
         url = f"{self.gateway_url}{path}"

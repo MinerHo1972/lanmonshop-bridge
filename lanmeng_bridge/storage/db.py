@@ -176,13 +176,15 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
 def init_db(db_path: Optional[str] = None):
     """初始化数据库 schema（幂等）
 
-    1. CREATE TABLE IF NOT EXISTS (4 张旧表 + 4 张新表 = 8 张)
-    2. 增量迁移（ALTER TABLE ADD COLUMN，已存在会跳过）
+    顺序:
+    1. ALTER TABLE 增量迁移（先加列, 兼容旧 DB 缺 jky_category 情况）
+    2. CREATE TABLE / CREATE INDEX（IF NOT EXISTS 幂等）
     """
     conn = get_connection(db_path)
+    # 先迁移列, 让后续 SCHEMA_SQL 的 CREATE INDEX 能找到目标列
+    _apply_migrations(conn)
     conn.executescript(SCHEMA_SQL)
     conn.commit()
-    _apply_migrations(conn)
     return conn
 
 
