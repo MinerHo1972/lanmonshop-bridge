@@ -191,18 +191,19 @@ async def lifespan(app: FastAPI):
         f"cron-f(每天 {f_hour:02d}:{f_minute:02d})"
     )
 
-    # ---------- cron-d/e bootstrap（scope 3）----------
+    # ---------- cron-d/e bootstrap（scope 4 实施后改用 cron_d/cron_e 真实逻辑）----------
     # 启动时若 jky_product_cache / jky_logistic_cache 为空，主动拉 1 次
+    # 不再使用 _bootstrap_logistic_cache 简化版（已废弃, 改走 cron_e diff-INSERT）
     try:
         _conn = get_connection()
         _prod_cnt = _conn.execute("SELECT COUNT(*) FROM jky_product_cache").fetchone()[0]
         _log_cnt = _conn.execute("SELECT COUNT(*) FROM jky_logistic_cache").fetchone()[0]
         if _prod_cnt == 0:
-            logger.info("[bootstrap] jky_product_cache 为空，立即拉取货品列表")
+            logger.info("[bootstrap] jky_product_cache 为空, 立即拉取货品列表")
             asyncio.create_task(cron_d.run_cron_d(jky_client, notifier))
         if _log_cnt == 0:
-            logger.info("[bootstrap] jky_logistic_cache 为空，立即拉取物流公司列表")
-            asyncio.create_task(_bootstrap_logistic_cache(jky_client, notifier))
+            logger.info("[bootstrap] jky_logistic_cache 为空, 立即拉取物流公司列表")
+            asyncio.create_task(cron_e.run_cron_e(jky_client, notifier))
     except Exception as e:
         logger.warning(f"[bootstrap] 拉取失败（非致命）: {e}")
 
@@ -274,53 +275,6 @@ def _jky_webhook_sign(params: dict, app_secret: str) -> str:
 def _get_jky_app_secret() -> str:
     """从 credentials 读取吉客云 AppSecret（webhook 验签用）"""
     return settings.get("_credentials", {}).get("jky_gateway", {}).get("app_secret", "")
-
-
-async def _bootstrap_logistic_cache(jky: JkyClient, notifier: FeishuNotifier) -> None:
-    """scope 3 bootstrap: 启动时拉取物流公司列表填充 jky_logistic_cache
-
-    （cron-e 的完整 soft-delete + diff-INSERT + 审计算法属 scope 4；
-    此处仅做启动期首填，保证 logistic_resolver 有基础数据。）
-    """
-    try:
-        resp = await jky.logistic_list({"pageIndex": 0, "pageSize": 200})
-    except Exception as e:
-        logger.error(f"[bootstrap-logistic] 拉取失败: {e}")
-        return
-    if resp.get("code") != 0:
-        logger.warning(f"[bootstrap-logistic] JKY 返回异常: {resp.get('msg')}")
-        return
-    data = resp.get("data", {})
-    if isinstance(data, dict):
-        items = data.get("list", data.get("rows", []))
-    elif isinstance(data, list):
-        items = data
-    else:
-        items = []
-    conn = get_connection()
-    try:
-        for it in items:
-            no = (
-                it.get("logisticNo") or it.get("code")
-                or it.get("logisticCompanyCode") or it.get("codeValue") or ""
-            )
-            name = (
-                it.get("logisticName") or it.get("name")
-                or it.get("logisticCompanyName") or it.get("codeName") or ""
-            )
-            if not no:
-                continue
-            conn.execute(
-                "INSERT OR REPLACE INTO jky_logistic_cache "
-                "(jky_logistic_no, jky_logistic_name, raw_json, fetched_at) "
-                "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-                (str(no), str(name), json.dumps(it, ensure_ascii=False)),
-            )
-        conn.commit()
-        logger.info(f"[bootstrap-logistic] jky_logistic_cache 填充 {len(items)} 条")
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"[bootstrap-logistic] 写入失败: {e}")
 
 
 async def process_oms_trade_confirm(trade_no: str, payload: dict) -> dict:
