@@ -15,6 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Request, HTTPException
 
 from .clients.jky import create_jky_client, JkyClient
+from .clients.jky_direct import create_jky_direct_client, JkyDirectClient
 from .clients.lanmonshop import create_lanmong_client, LanmongClient
 from .config import load_settings
 from .core.logistic_resolver import LogisticResolver
@@ -38,6 +39,7 @@ settings = load_settings()
 scheduler = AsyncIOScheduler()
 lanmong_client: LanmongClient = None
 jky_client: JkyClient = None
+jky_direct: JkyDirectClient = None
 sku_resolver: SkuResolver = None
 logistic_resolver: LogisticResolver = None
 notifier: FeishuNotifier = None
@@ -104,7 +106,7 @@ async def _run_cron_f():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI 生命周期：启动时初始化，关闭时清理"""
-    global lanmong_client, jky_client, sku_resolver, logistic_resolver, notifier
+    global lanmong_client, jky_client, jky_direct, sku_resolver, logistic_resolver, notifier
 
     # 初始化
     logger.info("初始化数据库...")
@@ -113,6 +115,7 @@ async def lifespan(app: FastAPI):
     logger.info("初始化客户端...")
     lanmong_client = create_lanmong_client(settings)
     jky_client = create_jky_client(settings)
+    jky_direct = create_jky_direct_client()
     sku_resolver = SkuResolver()
     logistic_resolver = LogisticResolver()
 
@@ -217,6 +220,8 @@ async def lifespan(app: FastAPI):
         await lanmong_client.close()
     if jky_client:
         await jky_client.close()
+    if jky_direct:
+        await jky_direct.close()
     if notifier:
         await notifier.close()
 
@@ -387,7 +392,99 @@ async def jky_webhook_oms_trade_confirm(request: Request):
     return {"code": 0, "msg": "ok", "data": result}
 
 
-# ---------- 入口 ----------
+# ---------- scope 3 — 吉客云直连 API 路由（PRD §5.3）----------
+
+from pydantic import BaseModel
+from typing import Optional
+
+
+class TradeCreateBody(BaseModel):
+    """创建销售单 — tradeOrder 包裹体"""
+    tradeOrder: dict
+
+
+class TradeAuditBody(BaseModel):
+    tradeIds: str
+
+
+class TradeCancelBody(BaseModel):
+    tradeNos: str
+    cancelReason: str = "420001"
+
+
+class TradeListBody(BaseModel):
+    pageNo: int = 1
+    pageSize: int = 50
+    modified_begin: Optional[str] = None
+    modified_end: Optional[str] = None
+    trade_begin: Optional[str] = None
+    trade_end: Optional[str] = None
+    tradeNo: Optional[str] = None
+    sourceTradeNos: Optional[str] = None
+    shopIds: Optional[str] = None
+    tradeStatus: Optional[str] = None
+    warehouseIds: Optional[str] = None
+
+
+class GoodsListBody(BaseModel):
+    pageIndex: int = 0
+    pageSize: int = 50
+    goodsNo: Optional[str] = None
+    goodsName: Optional[str] = None
+    barcode: Optional[str] = None
+
+
+class LogisticListBody(BaseModel):
+    pageIndex: int = 0
+    pageSize: int = 50
+
+
+@app.post("/jky/trade/create")
+async def jky_trade_create(body: TradeCreateBody):
+    """创建销售单"""
+    global jky_direct
+    return await jky_direct.trade_create(body.tradeOrder)
+
+
+@app.post("/jky/trade/audit")
+async def jky_trade_audit(body: TradeAuditBody):
+    """审核销售单"""
+    global jky_direct
+    return await jky_direct.trade_audit(body.tradeIds)
+
+
+@app.post("/jky/trade/cancel")
+async def jky_trade_cancel(body: TradeCancelBody):
+    """取消销售单"""
+    global jky_direct
+    return await jky_direct.trade_cancel(body.tradeNos, body.cancelReason)
+
+
+@app.post("/jky/trade/list")
+async def jky_trade_list(body: TradeListBody):
+    """查询销售单列表"""
+    global jky_direct
+    biz = body.model_dump(exclude_none=True)
+    # pageNo 1-based → pageIndex 0-based
+    biz["pageIndex"] = biz.pop("pageNo", 1) - 1
+    return await jky_direct.trade_list(biz)
+
+
+@app.post("/jky/goods/list")
+async def jky_goods_list(body: GoodsListBody):
+    """搜索货品"""
+    global jky_direct
+    biz = body.model_dump(exclude_none=True)
+    return await jky_direct.goods_search(biz)
+
+
+@app.post("/jky/logistic/list")
+async def jky_logistic_list(body: LogisticListBody):
+    """查询物流公司列表"""
+    global jky_direct
+    biz = body.model_dump(exclude_none=True)
+    return await jky_direct.logistic_list(biz)
+
 
 def main():
     """CLI 入口"""
