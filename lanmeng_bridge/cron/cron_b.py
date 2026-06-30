@@ -99,7 +99,7 @@ async def run_cron_b(
         # 反查商品项（从 order_map 关联的原始订单）
         # 简单方案：通过 jky_trade_no 反查 assemblyGoodsDetail 不太可行
         # 此处简化：回传时只传物流信息，商品列表由中台自行匹配
-        items = [{"skuNo": "", "num": 0}]  # 占位，实际需从订单详情获取
+        items = [{"orderItemId": 0, "num": 0}]  # 占位，文档要求 orderItemId（非 skuNo），实际需从订单详情获取
 
         # 回传中台
         retry = RetryState()

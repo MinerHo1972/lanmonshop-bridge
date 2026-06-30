@@ -9,11 +9,14 @@ import httpx
 from ..config import load_settings
 
 # ---------- 签名算法 ----------
-# 算法：md5(appKey & timestamp & appSecret).toUpperCase()
+# 算法（来自中台对外开放接口规范 2026-06-22 PDF）：
+# sign = md5(appKey & timestamp & appSecret).toUpperCase()
+# timestamp = 秒级（不是毫秒！）
+# 参考：docs/中台对外开放接口规范-蓝盟-20260622.pdf 第2页
 
 
 def _sign(app_key: str, app_secret: str, timestamp: str) -> str:
-    raw = app_key + timestamp + app_secret
+    raw = f"{app_key}&{timestamp}&{app_secret}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest().upper()
 
 
@@ -28,7 +31,7 @@ class LanmongClient:
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(connect=5, read=20, write=20, pool=5))
 
     def _headers(self) -> dict:
-        timestamp = str(int(time.time() * 1000))
+        timestamp = str(int(time.time()))  # 秒级（非毫秒！文档原文）
         sign = _sign(self.app_key, self.app_secret, timestamp)
         return {
             "appKey": self.app_key,
@@ -47,34 +50,56 @@ class LanmongClient:
 
     async def get_deliver_orders(
         self,
-        page_no: int = 1,
+        page_num: int = 1,
         page_size: int = 50,
-        start_time: Optional[str] = None,
-        end_time: Optional[str] = None,
-        state: int = 1,
+        time_start: Optional[str] = None,
+        time_end: Optional[str] = None,
+        pay_time_start: Optional[str] = None,
+        pay_time_end: Optional[str] = None,
+        supplier_update_time_start: Optional[str] = None,
+        supplier_update_time_end: Optional[str] = None,
+        order_no: Optional[str] = None,
+        state: str = "1",
     ) -> dict:
         """拉取待发货订单
 
         POST /open/v1/order/getDeliverOrders
-        state=1 = 已支付待审核/待发货
+        文档 P44: 请求参数 pageNum/pageSize/timeStart/timeEnd/payTimeStart/payTimeEnd/state
+        state: "1"=已支付待审核, "2"=待发货, "4"=已发货, "-2"=已取消
         """
         body = {
-            "pageNo": page_no,
+            "pageNum": page_num,
             "pageSize": page_size,
-            "state": state,
         }
-        if start_time:
-            body["startTime"] = start_time
-        if end_time:
-            body["endTime"] = end_time
+        if time_start:
+            body["timeStart"] = time_start
+        if time_end:
+            body["timeEnd"] = time_end
+        if pay_time_start:
+            body["payTimeStart"] = pay_time_start
+        if pay_time_end:
+            body["payTimeEnd"] = pay_time_end
+        if supplier_update_time_start:
+            body["supplierUpdateTimeStart"] = supplier_update_time_start
+        if supplier_update_time_end:
+            body["supplierUpdateTimeEnd"] = supplier_update_time_end
+        if order_no:
+            body["orderNo"] = order_no
+        if state:
+            body["state"] = state
         return await self._post("/open/v1/order/getDeliverOrders", body)
 
-    async def review_order(self, order_id: int) -> dict:
+    async def review_order(self, order_no: str, result: int = 0, reason: Optional[str] = None) -> dict:
         """审核订单（自动过审）
 
         POST /open/v1/order/reviewOrder
+        文档 P48-49: {list: [{orderNo, result, reason?}]}
+        result: 0=通过, -1=驳回取消
         """
-        return await self._post("/open/v1/order/reviewOrder", {"orderId": order_id})
+        body = {"list": [{"orderNo": order_no, "result": result}]}
+        if reason:
+            body["list"][0]["reason"] = reason
+        return await self._post("/open/v1/order/reviewOrder", body)
 
     async def sync_order_express(
         self,
@@ -90,17 +115,22 @@ class LanmongClient:
         """回传物流单号
 
         POST /open/v1/order/syncOrderExpress
-        items = [{skuNo, num}, ...]
+        文档 P50-52: list: [{orderId/orderNo, warehouseId, warehouseName,
+                          expressName/expressCode, expressNo,
+                          orderItems: [{orderItemId, num}]}]
+        items 格式: [{orderItemId, num}]
         """
         body = {
-            "orderId": order_id,
-            "orderNo": order_no,
-            "expressNo": express_no,
-            "expressCode": express_code,
-            "expressName": express_name,
-            "warehouseId": warehouse_id,
-            "warehouseName": warehouse_name,
-            "orderItems": items,
+            "list": [{
+                "orderId": order_id,
+                "orderNo": order_no,
+                "expressNo": express_no,
+                "expressCode": express_code,
+                "expressName": express_name,
+                "warehouseId": warehouse_id,
+                "warehouseName": warehouse_name,
+                "orderItems": items,
+            }]
         }
         return await self._post("/open/v1/order/syncOrderExpress", body)
 
@@ -113,9 +143,15 @@ class LanmongClient:
 def create_lanmong_client(settings: dict) -> LanmongClient:
     """从 settings 字典创建客户端"""
     cfg = settings.get("lanmong", {})
-    creds = settings.get("_credentials", {}).get("lanmong", {})
+    # credentials.yaml 嵌套路径: credentials.lanmenshop
+    # config.py 将整个 yaml 注入到 _credentials，所以取 creds.credentials.lanmenshop
+    creds = (
+        settings.get("_credentials", {})
+        .get("credentials", {})
+        .get("lanmenshop", {})
+    )
     return LanmongClient(
         base_url=cfg.get("base_url", "https://test-zt-api.lanmonshop.com"),
-        app_key=creds.get("app_key", ""),
-        app_secret=creds.get("app_secret", ""),
+        app_key=creds.get("appkey", ""),   # 文档字段名 appKey, yaml 存为 appkey
+        app_secret=creds.get("secret", ""),
     )

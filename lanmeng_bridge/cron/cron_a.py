@@ -34,13 +34,17 @@ async def run_cron_a(
     logger.info("[cron-a] 开始拉单")
 
     try:
-        resp = await lanmong.get_deliver_orders(state=1)
+        resp = await lanmong.get_deliver_orders(state="1")
     except Exception as e:
         logger.error(f"[cron-a] 拉单失败: {e}")
         return
 
-    data = resp.get("data", {})
-    orders = data.get("list", [])
+    resp_data = resp.get("data", {})
+    # 文档 P45-47: data 可能为 []（空结果）或 {orderList: [...], total: N}
+    if isinstance(resp_data, dict):
+        orders = resp_data.get("orderList", [])
+    else:
+        orders = resp_data if isinstance(resp_data, list) else []
     if not orders:
         logger.info("[cron-a] 无新订单")
         return
@@ -94,8 +98,8 @@ async def run_cron_a(
         # 自动过审
         if auto_review:
             try:
-                review_resp = await lanmong.review_order(order_id)
-                if review_resp.get("result") != 0:
+                review_resp = await lanmong.review_order(order_no)  # 文档: 传渠道单号, 非数字ID
+                if review_resp.get("code") != 0:
                     logger.warning(f"[cron-a] {order_no} 过审失败: {review_resp}")
                     continue
                 transition(map_id, STATE_AUDITED, "cron_a")
