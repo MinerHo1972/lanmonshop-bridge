@@ -18,7 +18,7 @@ from ..core.state_machine import transition, STATE_INIT, STATE_AUDITED, \
 from ..core.sku_resolver import SkuResolver
 from ..core.exception_handler import RetryState, classify_error, Severity
 from ..notify.feishu import FeishuNotifier
-from ..storage.db import get_connection
+from ..storage.db import get_connection, get_cursor, set_cursor
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +33,25 @@ async def run_cron_a(
     """中台 → 吉客云 订单同步"""
     logger.info("[cron-a] 开始拉单")
 
+    # 读取游标，默认最近 30 天
+    from datetime import datetime, timedelta
+    CURSOR_KEY = "cron_a_last_pull"
+    last_pull = get_cursor(CURSOR_KEY)
+    if last_pull:
+        time_start = last_pull
+        logger.info(f"[cron-a] 增量拉取: supplierUpdateTime >= {time_start}")
+    else:
+        time_start = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"[cron-a] 首次拉取（默认 30 天）: supplierUpdateTime >= {time_start}")
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     try:
-        resp = await lanmong.get_deliver_orders(state="1")
+        resp = await lanmong.get_deliver_orders(
+            state="1",
+            supplier_update_time_start=time_start,
+            supplier_update_time_end=now_str,
+        )
     except Exception as e:
         logger.error(f"[cron-a] 拉单失败: {e}")
         return
@@ -191,3 +208,7 @@ async def run_cron_a(
             transition(map_id, STATE_JKY_CREATED, "cron_a")
 
     logger.info("[cron-a] 完成")
+
+    # 保存游标
+    set_cursor(CURSOR_KEY, now_str)
+    logger.info(f"[cron-a] 游标已更新: {now_str}")

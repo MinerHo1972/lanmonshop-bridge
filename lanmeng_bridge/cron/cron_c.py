@@ -41,6 +41,7 @@ async def run_cron_c(
         WHERE jky_trade_no IS NOT NULL
           AND platform_state IN (-2, -3, -4)
           AND closed_at IS NULL
+          AND updated_at > datetime('now', '-30 days')
           AND (
             -- 路径 1: 未发货待取消 (jky_created)
             state = 'jky_created'

@@ -40,6 +40,7 @@ async def run_cron_b(
         WHERE state IN ('jky_created', 'jky_shipped', 'failed')
           AND jky_trade_no IS NOT NULL
           AND closed_at IS NULL
+          AND updated_at > datetime('now', '-30 days')
         ORDER BY updated_at ASC
         LIMIT 50"""
     ).fetchall()

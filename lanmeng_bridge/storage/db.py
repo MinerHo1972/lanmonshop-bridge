@@ -147,6 +147,13 @@ CREATE TABLE IF NOT EXISTS api_call_log (
 CREATE INDEX IF NOT EXISTS idx_api_log_source ON api_call_log(source);
 CREATE INDEX IF NOT EXISTS idx_api_log_method ON api_call_log(method);
 CREATE INDEX IF NOT EXISTS idx_api_log_created ON api_call_log(created_at);
+
+-- cron 游标（增量拉取位置）
+CREATE TABLE IF NOT EXISTS cron_cursor (
+    cursor_key TEXT PRIMARY KEY,
+    cursor_value TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -253,3 +260,27 @@ def log_api_call(
     except Exception:
         _db_logger = logging.getLogger("lanmonshop-bridge.db")
         _db_logger.exception("[db] log_api_call 写入失败")
+
+
+def get_cursor(cursor_key: str, default: str = "") -> str:
+    """读取 cron 游标值"""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT cursor_value FROM cron_cursor WHERE cursor_key = ?",
+        (cursor_key,),
+    ).fetchone()
+    return row["cursor_value"] if row else default
+
+
+def set_cursor(cursor_key: str, cursor_value: str) -> None:
+    """写入 cron 游标值（UPSERT）"""
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO cron_cursor (cursor_key, cursor_value, updated_at)
+           VALUES (?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(cursor_key) DO UPDATE SET
+               cursor_value = excluded.cursor_value,
+               updated_at = CURRENT_TIMESTAMP""",
+        (cursor_key, cursor_value),
+    )
+    conn.commit()
