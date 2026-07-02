@@ -18,7 +18,7 @@ lanmong:
 
 # 吉客云 Gateway（hermes-web-api 代理路由）
 jky:
-  gateway_url: "http://localhost:8088"
+  gateway_url: "http://localhost:18433"
   # API key 从 credentials.yaml 读取
 
 # Cron 调度
