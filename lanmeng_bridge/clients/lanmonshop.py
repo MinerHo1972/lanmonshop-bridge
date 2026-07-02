@@ -1,12 +1,16 @@
 """蓝盟中台 API 封装 — 鉴权签名 + 3 个接口"""
 
 import hashlib
+import json
+import logging
 import time
 from typing import Any, Optional
 
 import httpx
 
 from ..config import load_settings
+
+logger = logging.getLogger("lanmonshop-bridge.lanmong")
 
 # ---------- 签名算法 ----------
 # 算法（来自中台对外开放接口规范 2026-06-22 PDF）：
@@ -42,9 +46,16 @@ class LanmongClient:
 
     async def _post(self, path: str, body: dict) -> dict:
         url = f"{self.base_url}{path}"
+        req_body = json.dumps(body, ensure_ascii=False, default=str)[:800]
+        logger.info(f"[lanmong] → {path} body={req_body}")
+        logger.debug(f"[lanmong] → {path} full_body={json.dumps(body, ensure_ascii=False, default=str)}")
         resp = await self._client.post(url, json=body, headers=self._headers())
         resp.raise_for_status()
-        return resp.json()
+        result = resp.json()
+        resp_body = json.dumps(result, ensure_ascii=False, default=str)[:800]
+        logger.info(f"[lanmong] ← {path} status={resp.status_code} body={resp_body}")
+        logger.debug(f"[lanmong] ← {path} full_body={json.dumps(result, ensure_ascii=False, default=str)}")
+        return result
 
     # ---- 接口 ----
 

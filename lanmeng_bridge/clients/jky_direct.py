@@ -52,11 +52,15 @@ class JkyDirectClient:
 
     async def _call(self, method: str, bizcontent: dict) -> dict:
         params = _build_signed_params(method, bizcontent)
-        logger.info(f"[jky_direct] {method} → size={len(json.dumps(bizcontent))}b")
+        req_body = json.dumps(bizcontent, ensure_ascii=False, default=str)[:800]
+        logger.info(f"[jky_direct] → {method} body={req_body}")
+        logger.debug(f"[jky_direct] → {method} full_body={json.dumps(bizcontent, ensure_ascii=False, default=str)}")
         resp = await self._client.post(API_URL, data=params)
         resp.raise_for_status()
         result = resp.json()
-        logger.info(f"[jky_direct] {method} ← code={result.get('code')} subCode={result.get('subCode', '')}")
+        resp_body = json.dumps(result, ensure_ascii=False, default=str)[:800]
+        logger.info(f"[jky_direct] ← {method} code={result.get('code')} subCode={result.get('subCode', '')} body={resp_body}")
+        logger.debug(f"[jky_direct] ← {method} full_body={json.dumps(result, ensure_ascii=False, default=str)}")
         return result
 
     # ---------- 销售单 ----------
