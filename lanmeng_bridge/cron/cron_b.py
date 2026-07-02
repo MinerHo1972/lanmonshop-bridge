@@ -88,27 +88,101 @@ async def run_cron_b(
             elif status_explain in ("已拆分",) or trade_status == 5010:
                 merge_type = "split"
 
-            if merge_type:
+            if merge_type == "merge":
                 online_trade_no = jky_order.get("onlineTradeNo", "")
-                logger.info(f"[cron-b] {jky_trade_no} 检测到{merge_type} (onlineTradeNo={online_trade_no})")
+                logger.info(f"[cron-b] {jky_trade_no} 检测到合并 (onlineTradeNo={online_trade_no})")
 
-                # 记录合并/拆分事件到 order_merge 表
+                # 查合并目标：按 sourceTradeNos 找活跃订单
+                target_trade_no = ""
+                target_postid = ""
+                target_logist_name = ""
+                target_online = ""
+                ref_trades = []
+                try:
+                    ref_resp = await jky.trade_list({"sourceTradeNos": online_trade_no, "pageSize": 5})
+                    if ref_resp.get("code") in (0, 200):
+                        ref_trades = ref_resp.get("result", {}).get("data", {}).get("trades", [])
+                        for ref in ref_trades:
+                            rt = ref.get("tradeStatus", 0)
+                            if rt not in (5020, -1):  # 非取消态 = 活跃目标单
+                                target_trade_no = ref.get("tradeNo", "")
+                                target_postid = ref.get("mainPostid", "")
+                                target_logist_name = ref.get("logisticName", "")
+                                target_online = ref.get("onlineTradeNo", "")
+                                logger.info(f"[cron-b] 合并目标 {target_trade_no} postid={target_postid}")
+                                break
+                except Exception as e:
+                    logger.warning(f"[cron-b] 查合并目标失败: {e}")
+
+                # 记录合并事件
                 try:
                     conn.execute(
                         """INSERT INTO order_merge
-                           (source_trade_no, target_trade_no,
-                            source_online_trade_no, merge_type,
-                            jky_status, order_map_id)
+                           (source_trade_no, target_trade_no, source_online_trade_no,
+                            merge_type, jky_status, order_map_id)
                         VALUES (?, ?, ?, ?, ?, ?)""",
-                        (jky_trade_no, "",  # target_trade_no 未知时留空
-                         online_trade_no, merge_type,
-                         trade_status, map_id),
+                        (jky_trade_no, target_trade_no or "", online_trade_no,
+                         merge_type, trade_status, map_id),
                     )
                     conn.commit()
                 except Exception as e:
                     logger.warning(f"[cron-b] order_merge 写入失败: {e}")
 
-                # 标记为完成（合并/拆分后物流由目标单处理）
+                # 如果找到合并目标且有物流单号 → 回传所有源单
+                if target_postid and target_trade_no:
+                    # 目标单的 onlineTradeNo 含所有源单号（逗号分隔）
+                    source_order_nos = [s.strip() for s in target_online.split(",") if s.strip()]
+                    if not source_order_nos:
+                        source_order_nos = [online_trade_no]
+                    logger.info(f"[cron-b] 合并发货回传: postid={target_postid} 涉及 {len(source_order_nos)} 笔源单")
+
+                    logistic_entry = logistic_resolver.resolve(target_logist_name)
+                    for src_order_no in source_order_nos:
+                        src_row = conn.execute(
+                            "SELECT id, platform_order_id, order_items_json FROM order_map WHERE platform_order_no = ?",
+                            (src_order_no,),
+                        ).fetchone()
+                        if not src_row:
+                            continue
+                        # 构建 items
+                        items = []
+                        try:
+                            order_items_raw = src_row["order_items_json"] or "[]"
+                            order_products = json.loads(order_items_raw)
+                            for prod in order_products:
+                                oiid = prod.get("orderItemId")
+                                num = prod.get("number", 1)
+                                if oiid:
+                                    items.append({"orderItemId": int(oiid), "num": int(num)})
+                        except (json.JSONDecodeError, ValueError, TypeError):
+                            pass
+                        try:
+                            sync_resp = await lanmong.sync_order_express(
+                                order_id=src_row["platform_order_id"],
+                                order_no=src_order_no,
+                                express_no=target_postid,
+                                express_code=logistic_entry.get("platform_code", "unknown"),
+                                express_name=logistic_entry.get("platform_name", target_logist_name),
+                                warehouse_id=0,
+                                warehouse_name="虚拟仓",
+                                items=items,
+                            )
+                            if sync_resp.get("code") == 0:
+                                conn.execute(
+                                    "UPDATE order_map SET logistic_no = ? WHERE id = ?",
+                                    (target_postid, src_row["id"]),
+                                )
+                                conn.commit()
+                                logger.info(f"[cron-b] {src_order_no} 合并物流回传成功 (postid={target_postid})")
+                            else:
+                                logger.warning(f"[cron-b] {src_order_no} 合并物流回传失败: code={sync_resp.get('code')}")
+                        except Exception as e:
+                            logger.warning(f"[cron-b] {src_order_no} 合并物流回传异常: {e}")
+                elif merge_type == "split":
+                    # 拆分处理（暂只记录）
+                    logger.info(f"[cron-b] {jky_trade_no} 检测到拆分, 暂仅记录")
+
+                # 标记为完成
                 transition(map_id, STATE_DONE, f"cron_b_{merge_type}")
                 continue
 
