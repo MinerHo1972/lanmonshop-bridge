@@ -48,24 +48,34 @@ notifier: FeishuNotifier = None
 # ---------- Cron 任务 ----------
 
 async def _run_cron_a():
-    global lanmong_client, jky_client, sku_resolver, notifier
+    global lanmong_client, jky_client, notifier
     try:
         await cron_a.run_cron_a(
-            lanmong_client, jky_client, sku_resolver, notifier,
+            lanmong_client, jky_client, notifier,
             auto_review=settings.get("auto_review", True),
         )
     except Exception as e:
         logger.exception(f"[cron-a] 未捕获异常: {e}")
+        if notifier:
+            try:
+                await notifier.alert_p1("cron-a", f"运行异常: {e}", 0, 0)
+            except Exception:
+                logger.exception("[cron-a] 告警发送也失败")
 
 
 async def _run_cron_b():
-    global lanmong_client, jky_client, sku_resolver, logistic_resolver, notifier
+    global lanmong_client, jky_client, logistic_resolver, notifier
     try:
         await cron_b.run_cron_b(
-            lanmong_client, jky_client, sku_resolver, logistic_resolver, notifier,
+            lanmong_client, jky_client, logistic_resolver, notifier,
         )
     except Exception as e:
         logger.exception(f"[cron-b] 未捕获异常: {e}")
+        if notifier:
+            try:
+                await notifier.alert_p1("cron-b", f"运行异常: {e}", 0, 0)
+            except Exception:
+                logger.exception("[cron-b] 告警发送也失败")
 
 
 async def _run_cron_c():
@@ -74,6 +84,11 @@ async def _run_cron_c():
         await cron_c.run_cron_c(jky_client, notifier)
     except Exception as e:
         logger.exception(f"[cron-c] 未捕获异常: {e}")
+        if notifier:
+            try:
+                await notifier.alert_p1("cron-c", f"运行异常: {e}", 0, 0)
+            except Exception:
+                logger.exception("[cron-c] 告警发送也失败")
 
 
 async def _run_cron_f():
@@ -82,6 +97,11 @@ async def _run_cron_f():
         await cron_f.run_cron_f(lanmong_client, jky_client, notifier)
     except Exception as e:
         logger.exception(f"[cron-f] 未捕获异常: {e}")
+        if notifier:
+            try:
+                await notifier.alert_p1("cron-f", f"运行异常: {e}", 0, 0)
+            except Exception:
+                logger.exception("[cron-f] 告警发送也失败")
 
 
 # ---------- 生命周期 ----------
@@ -99,7 +119,7 @@ async def lifespan(app: FastAPI):
     logger.info("初始化客户端...")
     lanmong_client = create_lanmong_client(settings)
     jky_client = create_jky_client(settings)
-    jky_direct = create_jky_direct_client()
+    jky_direct = create_jky_direct_client(settings)
     sku_resolver = SkuResolver()
     logistic_resolver = LogisticResolver()
 
@@ -373,6 +393,7 @@ class TradeListBody(BaseModel):
     trade_begin: Optional[str] = None
     trade_end: Optional[str] = None
     tradeNo: Optional[str] = None
+    tradeNos: Optional[str] = None          # 批量查: 逗号分隔 tradeNo
     sourceTradeNos: Optional[str] = None
     shopIds: Optional[str] = None
     tradeStatus: Optional[str] = None

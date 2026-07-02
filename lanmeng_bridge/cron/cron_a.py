@@ -9,13 +9,13 @@
 6. 记录 state 变更到 order_map + order_status_log
 """
 
+import json
 import logging
 
 from ..clients.lanmonshop import LanmongClient
 from ..clients.jky import JkyClient
 from ..core.state_machine import transition, STATE_INIT, STATE_AUDITED, \
     STATE_JKY_CREATED, STATE_SKIPPED, STATE_CANCELLED
-from ..core.sku_resolver import SkuResolver
 from ..core.exception_handler import RetryState, classify_error, Severity
 from ..notify.feishu import FeishuNotifier
 from ..storage.db import get_connection, get_cursor, set_cursor
@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 async def run_cron_a(
     lanmong: LanmongClient,
     jky: JkyClient,
-    sku_resolver: SkuResolver,
     notifier: FeishuNotifier,
     auto_review: bool = True,
 ):
@@ -208,6 +207,12 @@ async def run_cron_a(
                 "UPDATE order_map SET jky_trade_no = ? WHERE id = ?",
                 (jky_trade_no, map_id),
             )
+            # 保存原始商品明细（物流回传时需要 orderItemId）
+            products_json = json.dumps(products, ensure_ascii=False, default=str)
+            conn.execute(
+                "UPDATE order_map SET order_items_json = ? WHERE id = ?",
+                (products_json, map_id),
+            )
             conn.commit()
             logger.info(f"[cron-a] {order_no} → JKY {jky_trade_no} 创单成功")
         except Exception as e:
@@ -218,7 +223,7 @@ async def run_cron_a(
         # 审核吉客云销售单
         if jky_trade_no:
             try:
-                audit_resp = await jky.trade_audit({"tradeNo": jky_trade_no})
+                audit_resp = await jky.trade_audit({"tradeIds": jky_trade_no})
                 if audit_resp.get("code") != 0:
                     logger.warning(f"[cron-a] {order_no} JKY 审核失败: {audit_resp}")
                     # 创单成功但审核失败 → 人工处理

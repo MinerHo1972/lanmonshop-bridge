@@ -61,7 +61,7 @@ async def _fetch_jky_trades(
         batch = trade_nos[i : i + JKY_BATCH_SIZE]
         try:
             resp = await jky.trade_list({
-                "tradeNos": batch,  # 批量查（JkyClient 已实现 trade_list）
+                "tradeNos": ",".join(batch),  # 批量查, 逗号分隔
                 "pageSize": len(batch),
             })
         except Exception as e:

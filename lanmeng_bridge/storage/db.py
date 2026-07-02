@@ -163,6 +163,8 @@ CREATE TABLE IF NOT EXISTS cron_cursor (
 _MIGRATIONS = [
     # v0.3.6 / P9: jky_product_cache 加 jky_category 字段（已有库 ALTER 加列, 新库走 CREATE TABLE）
     "ALTER TABLE jky_product_cache ADD COLUMN jky_category TEXT",
+    # v0.3.6 / bugfix #5: order_map 加 order_items_json（物流回传需要原始 orderItemId）
+    "ALTER TABLE order_map ADD COLUMN order_items_json TEXT",
 ]
 
 

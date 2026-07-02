@@ -13,47 +13,23 @@ from ..storage.db import log_api_call
 logger = logging.getLogger("lanmonshop-bridge.jky_direct")
 
 API_URL = "https://open.jackyun.com/open/openapi/do"
-APPKEY = "83311133"
-APPSECRET = "48c5316d29d745cc9db0bd79fdc20d34"
-
-
-def _sign(params: dict) -> str:
-    """吉客云签名算法：md5(appSecret + concat_sorted_kv + appSecret)"""
-    excluded = {"sign", "token", "contextid"}
-    filtered = {k: v for k, v in params.items() if k not in excluded and v is not None}
-    concat = "".join(f"{k}{filtered[k]}" for k in sorted(filtered))
-    raw = f"{APPSECRET}{concat}{APPSECRET}".lower()
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
-
-
-def _build_params(method: str, bizcontent: dict) -> dict:
-    """构造吉客云开放平台请求参数"""
-    return {
-        "method": method,
-        "appkey": APPKEY,
-        "version": "v1.0",
-        "contenttype": "json",
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "bizcontent": json.dumps(bizcontent, ensure_ascii=False, separators=(",", ":")),
-    }
-
-
-def _build_signed_params(method: str, bizcontent: dict) -> dict:
-    params = _build_params(method, bizcontent)
-    params["sign"] = _sign(params)
-    return params
+# fallback 值（优先从 credentials.yaml → jky_direct 读取）
+APPKEY_FALLBACK = "83311133"
+APPSECRET_FALLBACK = "48c5316d29d745cc9db0bd79fdc20d34"
 
 
 class JkyDirectClient:
     """吉客云开放平台直连客户端"""
 
-    def __init__(self):
+    def __init__(self, appkey: str, app_secret: str):
+        self.appkey = appkey
+        self.app_secret = app_secret
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10, read=30, write=10, pool=5),
         )
 
     async def _call(self, method: str, bizcontent: dict) -> dict:
-        params = _build_signed_params(method, bizcontent)
+        params = self._build_signed_params(method, bizcontent)
         req_body = json.dumps(bizcontent, ensure_ascii=False, default=str)
         logger.info(f"[jky_direct] → {method} body={req_body[:800]}")
         logger.debug(f"[jky_direct] → {method} full_body={req_body}")
@@ -91,6 +67,30 @@ class JkyDirectClient:
                 error=error_msg,
                 duration_ms=duration,
             )
+
+    def _sign(self, params: dict) -> str:
+        """吉客云签名算法：md5(appSecret + concat_sorted_kv + appSecret)"""
+        excluded = {"sign", "token", "contextid"}
+        filtered = {k: v for k, v in params.items() if k not in excluded and v is not None}
+        concat = "".join(f"{k}{filtered[k]}" for k in sorted(filtered))
+        raw = f"{self.app_secret}{concat}{self.app_secret}".lower()
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    def _build_params(self, method: str, bizcontent: dict) -> dict:
+        """构造吉客云开放平台请求参数"""
+        return {
+            "method": method,
+            "appkey": self.appkey,
+            "version": "v1.0",
+            "contenttype": "json",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "bizcontent": json.dumps(bizcontent, ensure_ascii=False, separators=(",", ":")),
+        }
+
+    def _build_signed_params(self, method: str, bizcontent: dict) -> dict:
+        params = self._build_params(method, bizcontent)
+        params["sign"] = self._sign(params)
+        return params
 
     # ---------- 销售单 ----------
 
@@ -133,5 +133,9 @@ class JkyDirectClient:
 
 
 # 工厂函数
-def create_jky_direct_client() -> JkyDirectClient:
-    return JkyDirectClient()
+def create_jky_direct_client(settings: dict) -> JkyDirectClient:
+    """从 settings 读取凭证创建直连客户端"""
+    creds = settings.get("_credentials", {}).get("jky_direct", {})
+    appkey = creds.get("appkey", "") or APPKEY_FALLBACK
+    app_secret = creds.get("app_secret", "") or APPSECRET_FALLBACK
+    return JkyDirectClient(appkey=appkey, app_secret=app_secret)

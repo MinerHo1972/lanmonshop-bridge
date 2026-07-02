@@ -6,13 +6,13 @@
 → state → synced → done
 """
 
+import json
 import logging
 
 from ..clients.lanmonshop import LanmongClient
 from ..clients.jky import JkyClient
 from ..core.state_machine import transition, STATE_JKY_SHIPPED, STATE_SYNCED, \
     STATE_DONE, STATE_FAILED
-from ..core.sku_resolver import SkuResolver
 from ..core.logistic_resolver import LogisticResolver
 from ..core.exception_handler import RetryState, classify_error, Severity
 from ..notify.feishu import FeishuNotifier
@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 async def run_cron_b(
     lanmong: LanmongClient,
     jky: JkyClient,
-    sku_resolver: SkuResolver,
     logistic_resolver: LogisticResolver,
     notifier: FeishuNotifier,
 ):
@@ -35,7 +34,7 @@ async def run_cron_b(
     conn = get_connection()
     rows = conn.execute(
         """SELECT id, platform_order_no, platform_order_id, jky_trade_no,
-                  state, retry_count, last_error
+                  state, retry_count, last_error, order_items_json
         FROM order_map
         WHERE state IN ('jky_created', 'jky_shipped', 'failed')
           AND jky_trade_no IS NOT NULL
@@ -97,10 +96,18 @@ async def run_cron_b(
         express_code = logistic_entry.get("platform_code", "unknown")
         express_name = logistic_entry.get("platform_name", logist_name)
 
-        # 反查商品项（从 order_map 关联的原始订单）
-        # 简单方案：通过 jky_trade_no 反查 assemblyGoodsDetail 不太可行
-        # 此处简化：回传时只传物流信息，商品列表由中台自行匹配
-        items = [{"orderItemId": 0, "num": 0}]  # 占位，文档要求 orderItemId（非 skuNo），实际需从订单详情获取
+        # 从 order_items_json 反查原始商品明细（含 orderItemId）
+        items = []
+        order_items_raw = row.get("order_items_json") or "[]"
+        try:
+            order_products = json.loads(order_items_raw)
+            for prod in order_products:
+                oiid = prod.get("orderItemId")
+                num = prod.get("number", 1)
+                if oiid:
+                    items.append({"orderItemId": int(oiid), "num": int(num)})
+        except (json.JSONDecodeError, ValueError, TypeError):
+            logger.warning(f"[cron-b] {order_no} order_items_json 解析失败: {order_items_raw[:200]}")
 
         # 回传中台
         retry = RetryState()
@@ -117,7 +124,7 @@ async def run_cron_b(
                     warehouse_name="虚拟仓",
                     items=items,
                 )
-                if sync_resp.get("result") == 0:
+                if sync_resp.get("code") == 0:
                     # 成功
                     conn.execute(
                         "UPDATE order_map SET logistic_no = ? WHERE id = ?",

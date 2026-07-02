@@ -87,7 +87,7 @@ async def run_cron_c(
         success = False
         while not retry.is_exhausted and not success:
             try:
-                cancel_resp = await jky.trade_cancel({"tradeNo": jky_trade_no})
+                cancel_resp = await jky.trade_cancel({"tradeNos": jky_trade_no})
                 if cancel_resp.get("code") == 0:
                     transition(map_id, STATE_JKY_CANCELLED, "cron_c")
                     logger.info(
