@@ -209,6 +209,10 @@ app = FastAPI(
 
 app.include_router(admin_router)
 app.state.scheduler = scheduler
+app.state.lanmong_client = lanmong_client
+app.state.jky_client = jky_client
+app.state.jky_direct = jky_direct
+app.state.notifier = notifier
 
 
 @app.get("/health")
