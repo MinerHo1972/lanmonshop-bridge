@@ -126,47 +126,74 @@ async def run_cron_a(
                 transition(map_id, STATE_FAILED, "cron_a", str(e))
                 continue
 
-        # 解析 SKU
+        # 解析 SKU → tradeOrderDetails（用 productNo 直查 jky_product_cache）
         products = order.get("orderProducts", [])
-        assembly_detail = []
+        trade_order_details = []
         skip_order = False
         for item in products:
-            sku_no = item.get("skuNo", "")
+            product_no = item.get("productNo", "")  # 蓝盟 18 开头 = JKY goodsNo
             qty = item.get("number", 1)
-            jky_goods_no = sku_resolver.resolve(sku_no)
-            if not jky_goods_no:
-                logger.warning(f"[cron-a] {order_no} SKU {sku_no} 缺映射")
-                # 记录缺映射，跳过此订单
-                transition(map_id, STATE_SKIPPED, "cron_a",
-                           f"SKU {sku_no} 缺映射")
-                await notifier.alert_p1(
-                    order_no, f"SKU {sku_no} 缺映射", 0, map_id
-                )
+            if not product_no:
+                logger.warning(f"[cron-a] {order_no} 商品缺 productNo，跳过")
+                transition(map_id, STATE_SKIPPED, "cron_a", "商品缺 productNo")
                 skip_order = True
                 break
-            assembly_detail.append({
-                "goodsNo": jky_goods_no,
-                "qty": qty,
+            # 从 jky_product_cache 取条码/名称
+            prod_row = conn.execute(
+                "SELECT jky_barcode, jky_goods_name FROM jky_product_cache WHERE jky_goods_no = ?",
+                (product_no,),
+            ).fetchone()
+            if not prod_row:
+                logger.warning(f"[cron-a] {order_no} 商品 {product_no} 不在缓存中")
+                transition(map_id, STATE_SKIPPED, "cron_a",
+                           f"商品 {product_no} 不在缓存")
+                skip_order = True
+                break
+            trade_order_details.append({
+                "goodsNo": product_no,
+                "barcode": prod_row["jky_barcode"] or "",
+                "goodsName": prod_row["jky_goods_name"] or "",
+                "specName": "默认",
+                "unit": "件",
+                "sellPrice": 0,
+                "sellCount": qty,
+                "sellTotal": 0,
             })
 
         if skip_order:
             continue
 
-        # 创建吉客云销售单
-        receiver_addr = (
-            f"{order.get('province', '')}"
-            f"{order.get('city', '')}"
-            f"{order.get('district', '')}"
-            f"{order.get('address', '')}"
-        )
+        # 创建吉客云销售单（按 JKY API 文档字段映射）
+        receiver_mobile = order.get("mobile", "")
         create_biz = {
-            "onlineTradeNo": str(order_id),
-            "receiverName": order.get("name", ""),
-            "receiverMobile": order.get("mobile", ""),
-            "receiverAddress": receiver_addr,
-            "expressPrice": order.get("expressPrice", 0),
-            "buyerMemo": order.get("remark", ""),
-            "assemblyGoodsDetail": assembly_detail,
+            "tradeOrder": {
+                "onlineTradeNo": order.get("orderNo", ""),   # FYY 开头
+                "shopName": "特渠分销对接",
+                "shopCode": "0125",
+                "warehouseCode": "02",
+                "tradeTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "tradeType": 1,
+                "totalFee": 0,
+                "payment": 0,
+                "chargeCurrency": "人民币",
+                "receiverName": order.get("name", ""),
+                "receiverMobile": receiver_mobile,
+                "phone": receiver_mobile,
+                "state": order.get("province", ""),           # JKY 省用 state
+                "city": order.get("city", ""),
+                "district": order.get("district", ""),
+                "address": order.get("address", ""),
+                "logisticCode": "STO",
+                "logisticName": "申通快递",
+                "logisticType": 1,
+                "payStatus": 9,
+                "chargeType": 3,
+                "customerName": "上海逸享云创电子商务有限公司",
+                "customerAccount": "C202606231285",
+                "expressPrice": order.get("expressPrice", 0),
+                "buyerMemo": order.get("remark", ""),
+                "tradeOrderDetails": trade_order_details,
+            }
         }
         try:
             create_resp = await jky.trade_create(create_biz)
