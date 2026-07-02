@@ -79,9 +79,9 @@ async def _run_cron_b():
 
 
 async def _run_cron_c():
-    global jky_client, notifier
+    global jky_client, lanmong_client, notifier
     try:
-        await cron_c.run_cron_c(jky_client, notifier)
+        await cron_c.run_cron_c(jky_client, notifier, lanmong_client)
     except Exception as e:
         logger.exception(f"[cron-c] 未捕获异常: {e}")
         if notifier:

@@ -6,11 +6,17 @@
 
 🆕 P0 边界 (PRD §9.1 + §4.8 已发订单): 若订单已被 webhook 推进到 jky_shipped
 (logistic_no IS NOT NULL) → 跳过 cancel，直接 P0 飞书告警 (资损风险)
+
+🆕 2026-07-03: 前置刷新 platform_state
+每次运行时先拉蓝盟已取消订单（30天窗口），更新 platform_state，
+确保拉单后蓝盟侧新取消的订单能被发现。
 """
 
 import logging
+from datetime import datetime, timedelta
 
 from ..clients.jky import JkyClient
+from ..clients.lanmonshop import LanmongClient
 from ..core.state_machine import transition, STATE_JKY_CANCELLED, STATE_FAILED
 from ..core.exception_handler import RetryState
 from ..notify.feishu import FeishuNotifier
@@ -26,14 +32,80 @@ CANCEL_STATES = {-2, -3, -4}
 SHIPPED_STATES = ("jky_shipped", "synced", "done")
 
 
+async def _refresh_cancelled_states(conn, lanmong: LanmongClient, cutoff: str):
+    """从蓝盟拉取近期取消订单，刷新 order_map.platform_state
+
+    只查 state=-2（已取消），30天窗口。
+    """
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    updated_count = 0
+    try:
+        resp = await lanmong.get_deliver_orders(
+            state="-2",
+            supplier_update_time_start=cutoff,
+            supplier_update_time_end=now_str,
+            page_size=200,
+        )
+        resp_data = resp.get("data", {})
+        if isinstance(resp_data, dict):
+            orders = resp_data.get("orderList", [])
+        else:
+            orders = resp_data if isinstance(resp_data, list) else []
+
+        if not orders:
+            logger.info("[cron-c] 蓝盟无近期取消订单")
+            return
+
+        for order in orders:
+            order_no = order.get("orderNo", "")
+            lanmeng_state = order.get("state")
+            if not order_no or lanmeng_state is None:
+                continue
+            if lanmeng_state >= 0:
+                continue  # 只更新已取消的
+
+            row = conn.execute(
+                "SELECT id, platform_state FROM order_map WHERE platform_order_no = ?",
+                (order_no,),
+            ).fetchone()
+            if row and row["platform_state"] != lanmeng_state:
+                conn.execute(
+                    "UPDATE order_map SET platform_state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (lanmeng_state, row["id"]),
+                )
+                updated_count += 1
+                logger.info(
+                    f"[cron-c] 刷新 platform_state: {order_no} "
+                    f"{row['platform_state']} → {lanmeng_state}"
+                )
+
+        conn.commit()
+        if updated_count:
+            logger.info(f"[cron-c] 已刷新 {updated_count} 条 platform_state")
+    except Exception as e:
+        logger.warning(f"[cron-c] 刷新 platform_state 异常（非致命）: {e}")
+
+
 async def run_cron_c(
     jky: JkyClient,
     notifier: FeishuNotifier,
+    lanmong: LanmongClient = None,
 ):
-    """检测中台已退但吉客云未退 → 调 JKY 取消 (已发订单触发 P0 边界)"""
+    """检测中台已退但吉客云未退 → 调 JKY 取消 (已发订单触发 P0 边界)
+
+    前置步骤：从蓝盟拉取近期取消订单，刷新 order_map.platform_state
+    确保 cron-c 能发现拉单后蓝盟侧新取消的订单。
+    """
     logger.info("[cron-c] 开始对账")
 
     conn = get_connection()
+    cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+
+    # ---- 前置步骤：刷新 platform_state ----
+    if lanmong:
+        await _refresh_cancelled_states(conn, lanmong, cutoff)
+
+    # ---- 原有取消逻辑 ----
     rows = conn.execute(
         """SELECT id, platform_order_no, jky_trade_no, platform_state,
                   state, logistic_no, retry_count, last_error
