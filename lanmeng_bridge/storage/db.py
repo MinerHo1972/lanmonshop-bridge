@@ -129,6 +129,24 @@ CREATE TABLE IF NOT EXISTS alert_counter (
     upgraded_to_p1_at TIMESTAMP         -- 升级 P1 时间（NULL = 未升级; 升级后 1h 内不再降回 P2）
 );
 CREATE INDEX IF NOT EXISTS idx_alert_counter_window ON alert_counter(window_start_ts);
+
+-- api 调用日志（两侧，长期保存）
+CREATE TABLE IF NOT EXISTS api_call_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    method TEXT NOT NULL,
+    request_body TEXT,
+    response_body TEXT,
+    http_status INTEGER,
+    api_code INTEGER,
+    api_sub_code TEXT,
+    error TEXT,
+    duration_ms INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_api_log_source ON api_call_log(source);
+CREATE INDEX IF NOT EXISTS idx_api_log_method ON api_call_log(method);
+CREATE INDEX IF NOT EXISTS idx_api_log_created ON api_call_log(created_at);
 """
 
 
@@ -207,3 +225,31 @@ def close_all():
     for path, conn in _connections.items():
         conn.close()
     _connections.clear()
+
+
+def log_api_call(
+    source: str,
+    method: str,
+    request_body: str = "",
+    response_body: str = "",
+    http_status: int = 0,
+    api_code: int = 0,
+    api_sub_code: str = "",
+    error: str = "",
+    duration_ms: int = 0,
+) -> None:
+    """写入 API 调用日志到 api_call_log 表"""
+    try:
+        conn = get_connection()
+        conn.execute(
+            """INSERT INTO api_call_log
+               (source, method, request_body, response_body,
+                http_status, api_code, api_sub_code, error, duration_ms)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (source, method, request_body, response_body,
+             http_status, api_code, api_sub_code, error, duration_ms),
+        )
+        conn.commit()
+    except Exception:
+        _db_logger = logging.getLogger("lanmonshop-bridge.db")
+        _db_logger.exception("[db] log_api_call 写入失败")

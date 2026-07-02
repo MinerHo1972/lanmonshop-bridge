@@ -8,6 +8,8 @@ from typing import Optional
 
 import httpx
 
+from ..storage.db import log_api_call
+
 logger = logging.getLogger("lanmonshop-bridge.jky_direct")
 
 API_URL = "https://open.jackyun.com/open/openapi/do"
@@ -52,16 +54,43 @@ class JkyDirectClient:
 
     async def _call(self, method: str, bizcontent: dict) -> dict:
         params = _build_signed_params(method, bizcontent)
-        req_body = json.dumps(bizcontent, ensure_ascii=False, default=str)[:800]
-        logger.info(f"[jky_direct] → {method} body={req_body}")
-        logger.debug(f"[jky_direct] → {method} full_body={json.dumps(bizcontent, ensure_ascii=False, default=str)}")
-        resp = await self._client.post(API_URL, data=params)
-        resp.raise_for_status()
-        result = resp.json()
-        resp_body = json.dumps(result, ensure_ascii=False, default=str)[:800]
-        logger.info(f"[jky_direct] ← {method} code={result.get('code')} subCode={result.get('subCode', '')} body={resp_body}")
-        logger.debug(f"[jky_direct] ← {method} full_body={json.dumps(result, ensure_ascii=False, default=str)}")
-        return result
+        req_body = json.dumps(bizcontent, ensure_ascii=False, default=str)
+        logger.info(f"[jky_direct] → {method} body={req_body[:800]}")
+        logger.debug(f"[jky_direct] → {method} full_body={req_body}")
+        t0 = datetime.now()
+        error_msg = ""
+        http_status = 0
+        api_code = 0
+        api_sub_code = ""
+        resp_body = ""
+        try:
+            resp = await self._client.post(API_URL, data=params)
+            resp.raise_for_status()
+            result = resp.json()
+            http_status = resp.status_code
+            api_code = result.get("code")
+            api_sub_code = result.get("subCode", "") or ""
+            resp_body = json.dumps(result, ensure_ascii=False, default=str)
+            logger.info(f"[jky_direct] ← {method} code={api_code} subCode={api_sub_code} body={resp_body[:800]}")
+            logger.debug(f"[jky_direct] ← {method} full_body={resp_body}")
+            return result
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"[jky_direct] ✗ {method} error={error_msg}")
+            raise
+        finally:
+            duration = int((datetime.now() - t0).total_seconds() * 1000)
+            log_api_call(
+                source="jky_direct",
+                method=method,
+                request_body=req_body,
+                response_body=resp_body,
+                http_status=http_status,
+                api_code=api_code,
+                api_sub_code=api_sub_code,
+                error=error_msg,
+                duration_ms=duration,
+            )
 
     # ---------- 销售单 ----------
 

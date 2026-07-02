@@ -9,6 +9,7 @@ from typing import Any, Optional
 import httpx
 
 from ..config import load_settings
+from ..storage.db import log_api_call
 
 logger = logging.getLogger("lanmonshop-bridge.lanmong")
 
@@ -46,16 +47,43 @@ class LanmongClient:
 
     async def _post(self, path: str, body: dict) -> dict:
         url = f"{self.base_url}{path}"
-        req_body = json.dumps(body, ensure_ascii=False, default=str)[:800]
-        logger.info(f"[lanmong] → {path} body={req_body}")
-        logger.debug(f"[lanmong] → {path} full_body={json.dumps(body, ensure_ascii=False, default=str)}")
-        resp = await self._client.post(url, json=body, headers=self._headers())
-        resp.raise_for_status()
-        result = resp.json()
-        resp_body = json.dumps(result, ensure_ascii=False, default=str)[:800]
-        logger.info(f"[lanmong] ← {path} status={resp.status_code} body={resp_body}")
-        logger.debug(f"[lanmong] ← {path} full_body={json.dumps(result, ensure_ascii=False, default=str)}")
-        return result
+        req_body = json.dumps(body, ensure_ascii=False, default=str)
+        logger.info(f"[lanmong] → {path} body={req_body[:800]}")
+        logger.debug(f"[lanmong] → {path} full_body={req_body}")
+        t0 = datetime.now()
+        error_msg = ""
+        http_status = 0
+        api_code = 0
+        api_sub_code = ""
+        resp_body = ""
+        try:
+            resp = await self._client.post(url, json=body, headers=self._headers())
+            resp.raise_for_status()
+            result = resp.json()
+            http_status = resp.status_code
+            api_code = result.get("code", 0)
+            api_sub_code = result.get("msg", "") or ""
+            resp_body = json.dumps(result, ensure_ascii=False, default=str)
+            logger.info(f"[lanmong] ← {path} status={http_status} body={resp_body[:800]}")
+            logger.debug(f"[lanmong] ← {path} full_body={resp_body}")
+            return result
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"[lanmong] ✗ {path} error={error_msg}")
+            raise
+        finally:
+            duration = int((datetime.now() - t0).total_seconds() * 1000)
+            log_api_call(
+                source="lanmong",
+                method=path,
+                request_body=req_body,
+                response_body=resp_body,
+                http_status=http_status,
+                api_code=api_code,
+                api_sub_code=api_sub_code,
+                error=error_msg,
+                duration_ms=duration,
+            )
 
     # ---- 接口 ----
 
