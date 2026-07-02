@@ -176,7 +176,7 @@ async def run_cron_a(
                 "payment": 0,
                 "chargeCurrency": "人民币",
                 "receiverName": order.get("name", ""),
-                "receiverMobile": receiver_mobile,
+                "mobile": receiver_mobile,
                 "phone": receiver_mobile,
                 "state": order.get("province", ""),           # JKY 省用 state
                 "city": order.get("city", ""),
@@ -189,7 +189,6 @@ async def run_cron_a(
                 "chargeType": 3,
                 "customerName": "上海逸享云创电子商务有限公司",
                 "customerAccount": "C202606231285",
-                "expressPrice": order.get("expressPrice", 0),
                 "buyerMemo": order.get("remark", ""),
                 "tradeOrderDetails": trade_order_details,
             }
@@ -216,29 +215,11 @@ async def run_cron_a(
             )
             conn.commit()
             logger.info(f"[cron-a] {order_no} → JKY {jky_trade_no} 创单成功")
+            transition(map_id, STATE_JKY_CREATED, "cron_a")
         except Exception as e:
             logger.error(f"[cron-a] {order_no} JKY 创单异常: {e}")
             transition(map_id, STATE_FAILED, "cron_a", str(e))
             continue
-
-        # 审核吉客云销售单
-        if jky_trade_no:
-            try:
-                audit_resp = await jky.trade_audit({"tradeIds": jky_trade_no})
-                if audit_resp.get("code") not in (0, 200):
-                    logger.warning(f"[cron-a] {order_no} JKY 审核失败: {audit_resp}")
-                    # 创单成功但审核失败 → 人工处理
-                    await notifier.alert_p1(
-                        order_no,
-                        f"JKY 创单成功但审核失败: {audit_resp.get('msg', '')}",
-                        0, map_id,
-                    )
-                else:
-                    logger.info(f"[cron-a] {order_no} JKY {jky_trade_no} 审核成功")
-            except Exception as e:
-                logger.warning(f"[cron-a] {order_no} JKY 审核异常: {e}")
-
-            transition(map_id, STATE_JKY_CREATED, "cron_a")
 
     logger.info("[cron-a] 完成")
 

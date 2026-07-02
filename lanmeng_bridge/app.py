@@ -381,7 +381,8 @@ class TradeCreateBody(BaseModel):
 
 
 class TradeAuditBody(BaseModel):
-    tradeIds: str
+    tradeNos: str
+    operator: str = "hermes"
 
 
 class TradeCancelBody(BaseModel):
@@ -428,7 +429,8 @@ async def jky_trade_create(body: TradeCreateBody):
 async def jky_trade_audit(body: TradeAuditBody):
     """审核销售单"""
     global jky_direct
-    return await jky_direct.trade_audit(body.tradeIds)
+    # 桥接侧用 tradeNos(str), JKY API 需要 tradeNos(Array) + operator
+    return await jky_direct.trade_audit([body.tradeNos], body.operator)
 
 
 @app.post("/jky/trade/cancel")

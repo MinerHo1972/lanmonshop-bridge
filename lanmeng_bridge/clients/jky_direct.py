@@ -98,9 +98,18 @@ class JkyDirectClient:
         """创建销售单"""
         return await self._call("oms.trade.ordercreate", {"tradeOrder": trade_order})
 
-    async def trade_audit(self, trade_ids: str) -> dict:
-        """审核销售单"""
-        return await self._call("oms.trade.audit.pass", {"tradeIds": trade_ids})
+    async def trade_audit(self, trade_nos: list, operator: str = "hermes") -> dict:
+        """审核销售单
+
+        按 JKY OTS 文档: tradeNos(Array,必填) + operator(String,必填)
+        Args:
+            trade_nos: 销售单号列表, 如 ["JY202607024277"]
+            operator: 操作员名称, 默认 "hermes"
+        """
+        return await self._call("oms.trade.audit.pass", {
+            "tradeNos": trade_nos,
+            "operator": operator,
+        })
 
     async def trade_cancel(self, trade_nos: str, cancel_reason: str = "420001") -> dict:
         """取消销售单 (字段名 tradeNos, 不是 tradeIds)"""

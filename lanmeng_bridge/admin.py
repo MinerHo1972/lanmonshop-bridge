@@ -577,10 +577,11 @@ async def _resubmit_one(row: dict, app_state) -> dict:
         if state in ("init", "failed"):
             return await _resubmit_create(row, app_state)
 
-        # Case 3: jky_created or audited → re-audit
+        # Case 3: jky_created or audited → 已有 JKY 单, 通知用户在 JKY 后台手动审核
         if state in ("jky_created", "audited"):
             if jky_trade_no:
-                return await _resubmit_audit(row, app_state)
+                return {"success": True, "action": "already_created",
+                        "msg": f"JKY 单 {jky_trade_no} 已存在, 请在 JKY 后台手动审核"}
             else:
                 # No JKY trade → re-create
                 return await _resubmit_create(row, app_state)
@@ -595,7 +596,7 @@ async def _resubmit_one(row: dict, app_state) -> dict:
 
 
 async def _resubmit_create(row: dict, app_state) -> dict:
-    """Re-create: fetch from lanmong, create in JKY, audit"""
+    """Re-create: fetch from lanmong, create in JKY (不审核, 用户在 JKY 后台手动处理)"""
     from .core.state_machine import transition, STATE_AUDITED, STATE_FAILED, STATE_JKY_CREATED
 
     order_id = row["id"]
@@ -605,14 +606,14 @@ async def _resubmit_create(row: dict, app_state) -> dict:
 
     jky_direct = app_state.jky_direct
     lanmong = app_state.lanmong_client
-    notifier = app_state.notifier
 
     if not jky_direct or not lanmong:
         return {"success": False, "action": "create", "msg": "客户端不可用"}
 
-    # If already has a JKY trade, re-audit instead
     if jky_trade_no:
-        return await _resubmit_audit(row, app_state)
+        # 已有 JKY 单 → 通知用户在 JKY 后台手动审核
+        return {"success": True, "action": "already_created",
+                "msg": f"JKY 单 {jky_trade_no} 已存在, 请在 JKY 后台手动审核"}
 
     # Step 1: Re-fetch order from lanmong by orderNo
     try:
@@ -683,7 +684,7 @@ async def _resubmit_create(row: dict, app_state) -> dict:
             "payment": 0,
             "chargeCurrency": "人民币",
             "receiverName": order.get("name", ""),
-            "receiverMobile": receiver_mobile,
+            "mobile": receiver_mobile,
             "phone": receiver_mobile,
             "state": order.get("province", ""),
             "city": order.get("city", ""),
@@ -696,7 +697,6 @@ async def _resubmit_create(row: dict, app_state) -> dict:
             "chargeType": 3,
             "customerName": "上海逸享云创电子商务有限公司",
             "customerAccount": "C202606231285",
-            "expressPrice": order.get("expressPrice", 0),
             "buyerMemo": order.get("remark", ""),
             "tradeOrderDetails": trade_order_details,
         }
@@ -721,49 +721,6 @@ async def _resubmit_create(row: dict, app_state) -> dict:
         transition(order_id, STATE_FAILED, "admin_resubmit", str(e))
         return {"success": False, "action": "create", "msg": f"JKY 创单异常: {e}"}
 
-    # Step 5: Audit
-    try:
-        audit_resp = await jky_direct.trade_audit(new_trade_no)
-        audit_code = audit_resp.get("code", -1)
-        if audit_code != 0:
-            msg = audit_resp.get("msg", "")
-            transition(order_id, STATE_JKY_CREATED, "admin_resubmit",
-                       f"创单成功但审核失败: {msg}")
-            if notifier:
-                await notifier.alert_p1(platform_order_no,
-                                        f"人工重提创单成功但审核失败: {msg}", 0, order_id)
-            return {"success": True, "action": "create_no_audit",
-                    "msg": f"创单成功({new_trade_no})但审核失败: {msg}"}
-    except Exception as e:
-        transition(order_id, STATE_JKY_CREATED, "admin_resubmit",
-                   f"创单成功但审核异常: {e}")
-        return {"success": True, "action": "create_no_audit",
-                "msg": f"创单成功({new_trade_no})但审核异常: {e}"}
-
     transition(order_id, STATE_JKY_CREATED, "admin_resubmit")
-    return {"success": True, "action": "create_audit",
-            "msg": f"创单+审核成功: {new_trade_no}"}
-
-
-async def _resubmit_audit(row: dict, app_state) -> dict:
-    """Re-audit: just re-call trade_audit for existing JKY trade"""
-    from .core.state_machine import transition, STATE_JKY_CREATED
-
-    order_id = row["id"]
-    jky_trade_no = row["jky_trade_no"]
-    platform_order_no = row["platform_order_no"]
-
-    jky_direct = app_state.jky_direct
-    if not jky_direct:
-        return {"success": False, "action": "audit", "msg": "jky_direct 不可用"}
-
-    try:
-        audit_resp = await jky_direct.trade_audit(jky_trade_no)
-        if audit_resp.get("code") != 0:
-            return {"success": False, "action": "audit",
-                    "msg": f"JKY {jky_trade_no} 审核失败: {audit_resp.get('msg','')}"}
-        transition(order_id, STATE_JKY_CREATED, "admin_resubmit")
-        return {"success": True, "action": "audit",
-                "msg": f"JKY {jky_trade_no} 审核成功"}
-    except Exception as e:
-        return {"success": False, "action": "audit", "msg": str(e)}
+    return {"success": True, "action": "create",
+            "msg": f"创单成功: {new_trade_no}, 请在 JKY 后台手动审核"}
