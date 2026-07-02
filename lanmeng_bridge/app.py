@@ -22,6 +22,7 @@ from .core.logistic_resolver import LogisticResolver
 from .core.sku_resolver import SkuResolver
 from .core.state_machine import transition, STATE_JKY_SHIPPED, STATE_SYNCED, STATE_DONE
 from .cron import cron_a, cron_b, cron_c, cron_d, cron_e, cron_f
+from .admin import router as admin_router
 from .notify.feishu import FeishuNotifier
 from .storage.db import init_db, close_all, get_connection
 
@@ -234,6 +235,9 @@ app = FastAPI(
     version="0.3.6",
     lifespan=lifespan,
 )
+
+app.include_router(admin_router)
+app.state.scheduler = scheduler
 
 
 @app.get("/health")
