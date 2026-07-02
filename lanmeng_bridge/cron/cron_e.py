@@ -140,7 +140,7 @@ def _diff_and_persist(
         "SELECT jky_logistic_no, jky_logistic_name, raw_json "
         "FROM jky_logistic_cache"
     ).fetchall()
-    old_map: dict[str, sqlite3.Row] = {r["jky_logistic_no"]: r for r in old_rows}
+    old_map: "dict[str, sqlite3.Row]" = {r["jky_logistic_no"]: r for r in old_rows}
     old_keys = set(old_map.keys())
     new_keys = {item["jky_logistic_no"] for item in new_items}
     new_map = {item["jky_logistic_no"]: item for item in new_items}

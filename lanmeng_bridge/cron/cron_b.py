@@ -64,11 +64,12 @@ async def run_cron_b(
             logger.error(f"[cron-b] {jky_trade_no} 查询失败: {e}")
             continue
 
-        if list_resp.get("code") != 0:
+        # JKY OTS 协议: code=200 表示成功（非 0），data 在 result.data 下
+        if list_resp.get("code") not in (0, 200):
             logger.warning(f"[cron-b] {jky_trade_no} JKY 查询异常: {list_resp}")
             continue
 
-        trades = list_resp.get("data", {}).get("trades", [])
+        trades = list_resp.get("result", {}).get("data", {}).get("trades", [])
         if not trades:
             continue
 
@@ -80,8 +81,39 @@ async def run_cron_b(
 
         # 已发货 = mainPostid 非空
         if not postid:
-            if status_explain in ("已完成", "9090") and not postid:
-                # 已完成但无物流单号？跳过
+            # ===== 合并/拆分检测（防止断链）=====
+            merge_type = None
+            if status_explain in ("已取消-被合并",) or trade_status == 5020:
+                merge_type = "merge"
+            elif status_explain in ("已拆分",) or trade_status == 5010:
+                merge_type = "split"
+
+            if merge_type:
+                online_trade_no = jky_order.get("onlineTradeNo", "")
+                logger.info(f"[cron-b] {jky_trade_no} 检测到{merge_type} (onlineTradeNo={online_trade_no})")
+
+                # 记录合并/拆分事件到 order_merge 表
+                try:
+                    conn.execute(
+                        """INSERT INTO order_merge
+                           (source_trade_no, target_trade_no,
+                            source_online_trade_no, merge_type,
+                            jky_status, order_map_id)
+                        VALUES (?, ?, ?, ?, ?, ?)""",
+                        (jky_trade_no, "",  # target_trade_no 未知时留空
+                         online_trade_no, merge_type,
+                         trade_status, map_id),
+                    )
+                    conn.commit()
+                except Exception as e:
+                    logger.warning(f"[cron-b] order_merge 写入失败: {e}")
+
+                # 标记为完成（合并/拆分后物流由目标单处理）
+                transition(map_id, STATE_DONE, f"cron_b_{merge_type}")
+                continue
+
+            # 其他无物流单号的情况
+            if status_explain in ("已完成", "9090"):
                 logger.warning(f"[cron-b] {jky_trade_no} 已完成但无物流单号")
             continue
 

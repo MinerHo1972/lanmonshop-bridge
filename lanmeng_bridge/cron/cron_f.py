@@ -49,14 +49,14 @@ JKY_SHIPPED_STATUSES = {"9090", "已完成", "已发货", "已签收"}
 
 async def _fetch_jky_trades(
     jky: JkyClient,
-    trade_nos: list[str],
-) -> dict[str, dict]:
+    trade_nos: list,
+) -> "dict[str, dict]":
     """按 tradeNo 批量查吉客云订单
 
     Returns:
         {trade_no: jky_order_dict}
     """
-    result: dict[str, dict] = {}
+    result: "dict[str, dict]" = {}
     for i in range(0, len(trade_nos), JKY_BATCH_SIZE):
         batch = trade_nos[i : i + JKY_BATCH_SIZE]
         try:
@@ -67,10 +67,11 @@ async def _fetch_jky_trades(
         except Exception as e:
             logger.warning(f"[cron-f] JKY trade_list 批量查失败 ({len(batch)} 条): {e}")
             continue
-        if resp.get("code") != 0:
+        # JKY OTS: code=200 成功，data 在 result.data
+        if resp.get("code") not in (0, 200):
             logger.warning(f"[cron-f] JKY trade_list 异常: {resp.get('msg', '')}")
             continue
-        data = resp.get("data", {})
+        data = resp.get("result", {}).get("data", {})
         trades = data.get("trades", data.get("list", data.get("rows", [])))
         for t in trades:
             tno = t.get("tradeNo") or t.get("trade_no") or ""
@@ -81,8 +82,8 @@ async def _fetch_jky_trades(
 
 def _detect_deviation(
     db_orders: list,
-    jky_trades: dict[str, dict],
-) -> list[dict]:
+    jky_trades: "dict[str, dict]",
+) -> list:
     """对比 DB 与 JKY 状态, 返回偏差列表
 
     Returns:
@@ -197,7 +198,7 @@ async def run_cron_f(
 
     # 2. 拉吉客云 trade_list 批量查
     retry = RetryState(max_attempts=2, backoff_minutes=[5])
-    jky_trades: dict[str, dict] = {}
+    jky_trades: "dict[str, dict]" = {}
     last_error: Optional[str] = None
 
     while not retry.is_exhausted:

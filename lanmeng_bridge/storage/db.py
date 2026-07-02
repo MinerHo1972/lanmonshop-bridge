@@ -11,7 +11,7 @@ Scope 2 扩展 (v0.3.6):
 import sqlite3
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 DB_PATH = os.environ.get(
     "LANMONSHOP_DB_PATH",
@@ -154,6 +154,22 @@ CREATE TABLE IF NOT EXISTS cron_cursor (
     cursor_value TEXT NOT NULL,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 🆕 合并/拆分事件追踪
+CREATE TABLE IF NOT EXISTS order_merge (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_trade_no TEXT NOT NULL,
+    source_online_trade_no TEXT,
+    merge_type TEXT NOT NULL,            -- 'merge' / 'split'
+    target_trade_no TEXT,
+    target_online_trade_no TEXT,
+    jky_status INTEGER,
+    order_map_id INTEGER,
+    detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (order_map_id) REFERENCES order_map(id)
+);
+CREATE INDEX IF NOT EXISTS idx_order_merge_source ON order_merge(source_trade_no);
+CREATE INDEX IF NOT EXISTS idx_order_merge_target ON order_merge(target_trade_no);
 """
 
 
@@ -165,6 +181,12 @@ _MIGRATIONS = [
     "ALTER TABLE jky_product_cache ADD COLUMN jky_category TEXT",
     # v0.3.6 / bugfix #5: order_map 加 order_items_json（物流回传需要原始 orderItemId）
     "ALTER TABLE order_map ADD COLUMN order_items_json TEXT",
+    # v0.3.6 / merge追踪: order_merge 补充缺失列（已有库无此列, 新库已有）
+    "ALTER TABLE order_merge ADD COLUMN source_online_trade_no TEXT",
+    "ALTER TABLE order_merge ADD COLUMN target_trade_no TEXT",
+    "ALTER TABLE order_merge ADD COLUMN target_online_trade_no TEXT",
+    "ALTER TABLE order_merge ADD COLUMN jky_status INTEGER",
+    "ALTER TABLE order_merge ADD COLUMN order_map_id INTEGER",
 ]
 
 
@@ -197,7 +219,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 
 
 # ---------- Connection Pool ----------
-_connections: dict[str, sqlite3.Connection] = {}
+_connections: Dict[str, "sqlite3.Connection"] = {}
 
 
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:

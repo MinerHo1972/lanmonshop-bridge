@@ -196,13 +196,14 @@ async def run_cron_a(
         }
         try:
             create_resp = await jky.trade_create(create_biz)
+            # JKY OTS: code=200 成功，tradeNo 在 result.tradeNo
             jky_code = create_resp.get("code", -1)
-            if jky_code != 0:
+            if jky_code not in (0, 200):
                 logger.error(f"[cron-a] {order_no} JKY 创单失败: {create_resp}")
                 transition(map_id, STATE_FAILED, "cron_a",
                            create_resp.get("msg", "JKY 创单失败"))
                 continue
-            jky_trade_no = create_resp.get("data", {}).get("result", {}).get("tradeNo", "")
+            jky_trade_no = create_resp.get("result", {}).get("tradeNo", "")
             conn.execute(
                 "UPDATE order_map SET jky_trade_no = ? WHERE id = ?",
                 (jky_trade_no, map_id),
@@ -224,7 +225,7 @@ async def run_cron_a(
         if jky_trade_no:
             try:
                 audit_resp = await jky.trade_audit({"tradeIds": jky_trade_no})
-                if audit_resp.get("code") != 0:
+                if audit_resp.get("code") not in (0, 200):
                     logger.warning(f"[cron-a] {order_no} JKY 审核失败: {audit_resp}")
                     # 创单成功但审核失败 → 人工处理
                     await notifier.alert_p1(
