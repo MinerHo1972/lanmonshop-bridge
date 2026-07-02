@@ -467,6 +467,16 @@ async def jky_trade_list(body: TradeListBody):
     biz = body.model_dump(exclude_none=True)
     # pageNo 1-based → pageIndex 0-based
     biz["pageIndex"] = biz.pop("pageNo", 1) - 1
+    # 字段名映射: bridge 命名 → JKY 原生参数名
+    FIELD_MAP = {
+        "modified_begin": "startModified",
+        "modified_end": "endModified",
+        "trade_begin": "startCreated",
+        "trade_end": "endCreated",
+    }
+    for old_key, new_key in FIELD_MAP.items():
+        if old_key in biz:
+            biz[new_key] = biz.pop(old_key)
     return await jky_direct.trade_list(biz)
 
 
