@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import RedirectResponse
 
 from .clients.jky import create_jky_client, JkyClient
 from .clients.jky_direct import create_jky_direct_client, JkyDirectClient
@@ -22,6 +23,7 @@ from .core.sku_resolver import SkuResolver
 from .core.state_machine import transition, STATE_JKY_SHIPPED, STATE_SYNCED, STATE_DONE
 from .cron import cron_a, cron_b, cron_c, cron_f
 from .admin import router as admin_router
+from .auth import router as auth_router
 from .notify.feishu import FeishuNotifier
 from .storage.db import init_db, close_all, get_connection
 
@@ -173,6 +175,12 @@ async def lifespan(app: FastAPI):
         **common_kwargs,
     )
 
+    # 将 app.state 赋值为实例化后的客户端（模块级赋值在 lifespan 开始时还是 None）
+    app.state.lanmong_client = lanmong_client
+    app.state.jky_client = jky_client
+    app.state.jky_direct = jky_direct
+    app.state.notifier = notifier
+
     scheduler.start()
     logger.info(
         f"Cron 任务已注册 (max_instances=1): "
@@ -208,11 +216,8 @@ app = FastAPI(
 )
 
 app.include_router(admin_router)
+app.include_router(auth_router)
 app.state.scheduler = scheduler
-app.state.lanmong_client = lanmong_client
-app.state.jky_client = jky_client
-app.state.jky_direct = jky_direct
-app.state.notifier = notifier
 
 
 @app.get("/health")
@@ -222,17 +227,7 @@ async def health():
 
 @app.get("/")
 async def root():
-    return {
-        "service": "lanmonshop-bridge",
-        "version": "0.3.6",
-        "scope": "scope 2 - 脚手架 + 6 cron 占位 + 8 表 schema",
-        "cron": {
-            "cron_a": "中台 → 吉客云 (5min)",
-            "cron_b": "吉客云 → 中台兜底 (60min)",
-            "cron_c": "中台退 → 吉客云取消 (5min)",
-            "cron_f": "三方状态对账 (03:30, scope 4 实施)",
-        },
-    }
+    return RedirectResponse(url="/admin")
 
 
 # ---------- webhook（scope 3 §4.8）----------
@@ -398,11 +393,15 @@ class TradeListBody(BaseModel):
     trade_begin: Optional[str] = None
     trade_end: Optional[str] = None
     tradeNo: Optional[str] = None
-    tradeNos: Optional[str] = None          # 批量查: 逗号分隔 tradeNo
     sourceTradeNos: Optional[str] = None
     shopIds: Optional[str] = None
     tradeStatus: Optional[str] = None
     warehouseIds: Optional[str] = None
+    # JKY OTS 原生参数（scroll 分页 + fields）
+    scrollId: Optional[str] = None
+    startModified: Optional[str] = None
+    endModified: Optional[str] = None
+    fields: Optional[str] = None
 
 
 class GoodsListBody(BaseModel):

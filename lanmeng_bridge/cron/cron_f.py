@@ -6,7 +6,7 @@
 对账策略（2026-07-03 重构）：
 1. 拉蓝盟 getDeliverOrders 全量订单（所有 state，30天窗口，分页）
 2. 拉 DB order_map 近30天记录
-3. 按 tradeNos 批量查 JKY 实时状态
+3. 按 tradeNo 批量查 JKY 实时状态
 4. 三端逐单匹配 → 偏差检测
 5. 汇总 + 日报推送 + 落库
 """
@@ -30,19 +30,23 @@ logger = logging.getLogger(__name__)
 LANMENG_STATE_MAP = {
     1: "已支付待审核",
     2: "待发货",
+    3: "部分发货",
     4: "已发货",
+    6: "已完成",
     -2: "已取消",
     -3: "已退款",
     -4: "已作废",
 }
 
 # 蓝盟需要拉的 state 列表（全量）
-LANMENG_STATES = ["-2", "1", "2", "4"]
+LANMENG_STATES = ["-4", "-3", "-2", "1", "2", "3", "4", "6"]
 
 # JKY 已发货/已完成状态
 JKY_SHIPPED_STATUSES = {"9090", "已完成", "已发货", "已签收"}
 
-JKY_BATCH_SIZE = 50
+# JKY 时间范围查询限制：跨度不超过 7 天（否则返回 0040139996）
+JKY_LOOKBACK_DAYS = 7
+JKY_SHOP_IDS = "2154377951944409856"  # 特渠分销对接 店铺 ID
 
 
 async def _pull_lanmong_orders(
@@ -97,33 +101,45 @@ async def _pull_lanmong_orders(
 
 
 async def _pull_jky_trades(
-    jky: JkyClient, trade_nos: list
+    jky: JkyClient, cutoff: str
 ) -> dict:
-    """按 tradeNo 批量查吉客云订单
+    """拉 JKY 全量（时间范围 scroll 分页）包含拆合单后继
+
+    改用时间段全量拉取（同 cron-b），确保后继单（不同 tradeNo）
+    也能被拉到，代替按 tradeNo 批量查（会漏后继单）。
 
     Returns:
         {tradeNo: jky_order_dict}
     """
     result = {}
-    for i in range(0, len(trade_nos), JKY_BATCH_SIZE):
-        batch = trade_nos[i: i + JKY_BATCH_SIZE]
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    scroll_id = ""
+    while True:
         try:
             resp = await jky.trade_list({
-                "tradeNos": ",".join(batch),
-                "pageSize": len(batch),
+                "scrollId": scroll_id,
+                "pageSize": 200,
+                "startModified": cutoff,
+                "endModified": now_str,
+                "shopIds": JKY_SHOP_IDS,
+                "fields": "tradeNo,onlineTradeNo,tradeStatus,tradeStatusExplain,mainPostid,logisticName,scrollId",
             })
         except Exception as e:
-            logger.warning(f"[cron-f] JKY 批量查失败 ({len(batch)} 条): {e}")
-            continue
+            logger.warning(f"[cron-f] JKY 全量拉取失败: {e}")
+            break
         if resp.get("code") not in (0, 200):
-            continue
-        data = resp.get("result", {}).get("data", {})
-        trades = data.get("trades", data.get("list", data.get("rows", [])))
+            break
+        trades = resp.get("result", {}).get("data", {}).get("trades", [])
+        if not trades:
+            break
         for t in trades:
-            tno = t.get("tradeNo") or t.get("trade_no") or ""
+            tno = t.get("tradeNo") or ""
             if tno:
                 result[tno] = t
-    logger.info(f"[cron-f] JKY 返回 {len(result)} 条")
+        scroll_id = resp.get("result", {}).get("data", {}).get("scrollId", "")
+        if not scroll_id or len(trades) < 200:
+            break
+    logger.info(f"[cron-f] JKY 全量返回 {len(result)} 条")
     return result
 
 
@@ -394,35 +410,110 @@ async def run_cron_f(
     # ---- 2. 拉 DB ----
     conn = get_connection()
     db_orders = conn.execute(
-        """SELECT id, platform_order_no, jky_trade_no, state,
-                  logistic_no, platform_state, last_error, updated_at
+        """SELECT id, platform_order_no, jky_trade_no, jky_state, state,
+                  logistic_no, platform_state, platform_unified,
+                  jky_unified, jky_effective_unified, bridge_unified,
+                  related_order_nos,
+                  last_error, updated_at
            FROM order_map
            WHERE updated_at >= ?
-           ORDER BY updated_at ASC""",
+           ORDER BY id ASC""",
         (cutoff,),
     ).fetchall()
     logger.info(f"[cron-f] DB 订单 {len(db_orders)} 条")
 
-    # ---- 3. 拉 JKY ----
-    trade_nos = [
-        r["jky_trade_no"] for r in db_orders if r["jky_trade_no"]
-    ]
+    # ---- 3. 拉 JKY 全量（时间范围 scroll，同 cron-b）----
     jky_trades = {}
-    if trade_nos:
-        retry = RetryState(max_attempts=2, backoff_minutes=[5])
-        while not retry.is_exhausted:
-            try:
-                jky_trades = await _pull_jky_trades(jky, trade_nos)
+    retry = RetryState(max_attempts=2, backoff_minutes=[5])
+    while not retry.is_exhausted:
+        try:
+            jky_trades = await _pull_jky_trades(jky, (datetime.now() - timedelta(days=JKY_LOOKBACK_DAYS)).strftime("%Y-%m-%d %H:%M:%S"))
+            break
+        except Exception as e:
+            retry.record_attempt(str(e))
+            logger.error(f"[cron-f] JKY 全量拉取失败 (attempt={retry.attempt}): {e}")
+            if retry.is_exhausted:
+                await notifier._send(
+                    f"[cron-f] 警告: JKY 全量拉取失败 (重试耗尽): {e}\n"
+                    "JKY 侧状态不可用于对账"
+                )
                 break
-            except Exception as e:
-                retry.record_attempt(str(e))
-                logger.error(f"[cron-f] JKY 批量查失败 (attempt={retry.attempt}): {e}")
-                if retry.is_exhausted:
-                    await notifier._send(
-                        f"[cron-f] 警告: JKY 批量查失败 (重试耗尽): {e}\n"
-                        "JKY 侧状态不可用于对账"
-                    )
-                    break
+
+    # ---- 3b. 兜底刷新 DB 统一态字段 ----
+    from ..core.shared_unified import platform_to_unified, resolve_jky_effective_state
+    successor_index = {}
+    for jky_data in jky_trades.values():
+        ts = str(jky_data.get("tradeStatus", "") or "")
+        if ts == "5020":
+            continue
+        online_parts = [p.strip() for p in jky_data.get("onlineTradeNo", "").split(",") if p.strip()]
+        if len(online_parts) > 1:
+            for part in online_parts:
+                successor_index.setdefault(part, []).append(jky_data)
+
+    def merge_related_order_nos(existing: str, discovered: list[str]) -> str:
+        values = {p.strip() for p in (existing or "").split(",") if p.strip()}
+        values.update(p.strip() for p in discovered if p and p.strip())
+        return ",".join(sorted(values))
+
+    refresh_count = 0
+    for r in db_orders:
+        order_no = r["platform_order_no"]
+        changes = []
+
+        # 蓝盟态刷新
+        if order_no in lanmong_orders:
+            lm_state = lanmong_orders[order_no].get("state", r["platform_state"])
+            new_lm = platform_to_unified(lm_state)
+            old_lm = r["platform_unified"] or ""
+            if new_lm != old_lm:
+                changes.append(f"platform: {old_lm}→{new_lm}")
+                conn.execute(
+                    "UPDATE order_map SET platform_unified = ? WHERE id = ?",
+                    (new_lm, r["id"]),
+                )
+
+        # JKY 态刷新（含拆合单检测）
+        trade_no = r["jky_trade_no"]
+        jky_data = jky_trades.get(trade_no) if trade_no else None
+        if not jky_data and order_no in successor_index:
+            jky_data = {
+                "tradeNo": trade_no or "",
+                "onlineTradeNo": order_no,
+                "tradeStatus": r["jky_state"] or "5020",
+            }
+        if jky_data:
+            resolved = resolve_jky_effective_state(jky_data, order_no, jky_trades, successor_index)
+            raw_ts = resolved["raw_ts"]
+            new_jky = resolved["raw_unified"]
+            new_effective = resolved["effective_unified"]
+            new_br = new_effective  # bridge 跟随 JKY 有效态
+            new_related = merge_related_order_nos(r["related_order_nos"] or "", resolved["related_order_nos"])
+            old_jky = r["jky_unified"] or ""
+            old_effective = r["jky_effective_unified"] or ""
+            old_br = r["bridge_unified"] or ""
+            if new_jky != old_jky:
+                changes.append(f"jky: {old_jky}→{new_jky}")
+            if new_effective != old_effective:
+                changes.append(f"effective: {old_effective}→{new_effective}")
+            if new_br != old_br:
+                changes.append(f"bridge: {old_br}→{new_br}")
+            if new_related and new_related != (r["related_order_nos"] or ""):
+                changes.append(f"related_order_nos: {r['related_order_nos'] or ''}→{new_related}")
+            if new_jky != old_jky or new_effective != old_effective or new_br != old_br or (
+                new_related and new_related != (r["related_order_nos"] or "")
+            ):
+                conn.execute(
+                    "UPDATE order_map SET jky_state = ?, jky_unified = ?, "
+                    "jky_effective_unified = ?, bridge_unified = ?, related_order_nos = ? WHERE id = ?",
+                    (raw_ts, new_jky, new_effective, new_br, new_related, r["id"]),
+                )
+
+        if changes:
+            refresh_count += 1
+            logger.info(f"[cron-f] 刷新 {order_no}: {'; '.join(changes)}")
+    conn.commit()
+    logger.info(f"[cron-f] 统一态刷新 {refresh_count} 条")
 
     # ---- 4. 三端对账 ----
     report = _build_report(lanmong_orders, db_orders, jky_trades)

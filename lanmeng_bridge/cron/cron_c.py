@@ -1,89 +1,24 @@
-"""cron-c：中台已退 → 吉客云取消（5min 对账）
+"""cron-c：三端取消/退款对比兜底（15min）
 
-检测：order_map 中 jky_created 状态 + platform_state=-2/-3/-4
-→ 调 JKY /jky/trade/cancel
-→ state → jky_cancelled
-
-🆕 P0 边界 (PRD §9.1 + §4.8 已发订单): 若订单已被 webhook 推进到 jky_shipped
-(logistic_no IS NOT NULL) → 跳过 cancel，直接 P0 飞书告警 (资损风险)
-
-🆕 2026-07-03: 前置刷新 platform_state
-每次运行时先拉蓝盟已取消订单（30天窗口），更新 platform_state，
-确保拉单后蓝盟侧新取消的订单能被发现。
+拉蓝盟 + JKY 两端全量（15天窗口）
+→ 对比 DB 统一态
+→ 蓝盟取消但 JKY 未取消 → 调 JKY cancel + 写统一字段
+→ JKY 取消但蓝盟未取消 → 飞书告警（避免资损）
 """
-
 import logging
 from datetime import datetime, timedelta
 
 from ..clients.jky import JkyClient
 from ..clients.lanmonshop import LanmongClient
-from ..core.state_machine import transition, STATE_JKY_CANCELLED, STATE_FAILED
-from ..core.exception_handler import RetryState
+from ..core.state_machine import transition as st_transition, STATE_JKY_CANCELLED
+from ..core.shared_unified import platform_to_unified, resolve_jky_effective_state
 from ..notify.feishu import FeishuNotifier
 from ..storage.db import get_connection
 
 logger = logging.getLogger(__name__)
-
-# 中台异常/取消/退款 state
-CANCEL_STATES = {-2, -3, -4}
-
-# 🆕 P0 判定: 吉客云已发货的本地权威信号 (webhook 写入 logistic_no + state 推进)
-# PRD §9.1 P0 第 1 条: "吉客云已发货但中台已退 (cron-c 失败 + 货已发)"
-SHIPPED_STATES = ("jky_shipped", "synced", "done")
-
-
-async def _refresh_cancelled_states(conn, lanmong: LanmongClient, cutoff: str):
-    """从蓝盟拉取近期取消订单，刷新 order_map.platform_state
-
-    只查 state=-2（已取消），30天窗口。
-    """
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    updated_count = 0
-    try:
-        resp = await lanmong.get_deliver_orders(
-            state="-2",
-            supplier_update_time_start=cutoff,
-            supplier_update_time_end=now_str,
-            page_size=200,
-        )
-        resp_data = resp.get("data", {})
-        if isinstance(resp_data, dict):
-            orders = resp_data.get("orderList", [])
-        else:
-            orders = resp_data if isinstance(resp_data, list) else []
-
-        if not orders:
-            logger.info("[cron-c] 蓝盟无近期取消订单")
-            return
-
-        for order in orders:
-            order_no = order.get("orderNo", "")
-            lanmeng_state = order.get("state")
-            if not order_no or lanmeng_state is None:
-                continue
-            if lanmeng_state >= 0:
-                continue  # 只更新已取消的
-
-            row = conn.execute(
-                "SELECT id, platform_state FROM order_map WHERE platform_order_no = ?",
-                (order_no,),
-            ).fetchone()
-            if row and row["platform_state"] != lanmeng_state:
-                conn.execute(
-                    "UPDATE order_map SET platform_state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (lanmeng_state, row["id"]),
-                )
-                updated_count += 1
-                logger.info(
-                    f"[cron-c] 刷新 platform_state: {order_no} "
-                    f"{row['platform_state']} → {lanmeng_state}"
-                )
-
-        conn.commit()
-        if updated_count:
-            logger.info(f"[cron-c] 已刷新 {updated_count} 条 platform_state")
-    except Exception as e:
-        logger.warning(f"[cron-c] 刷新 platform_state 异常（非致命）: {e}")
+LOOKBACK_DAYS = 15
+JKY_LOOKBACK_DAYS = 7          # JKY API 限制：时间跨度不超过 7 天
+JKY_SHOP_IDS = "2154377951944409856"  # 特渠分销对接 店铺 ID
 
 
 async def run_cron_c(
@@ -91,108 +26,181 @@ async def run_cron_c(
     notifier: FeishuNotifier,
     lanmong: LanmongClient = None,
 ):
-    """检测中台已退但吉客云未退 → 调 JKY 取消 (已发订单触发 P0 边界)
-
-    前置步骤：从蓝盟拉取近期取消订单，刷新 order_map.platform_state
-    确保 cron-c 能发现拉单后蓝盟侧新取消的订单。
-    """
-    logger.info("[cron-c] 开始对账")
-
+    """三端取消对比兜底"""
+    logger.info("[cron-c] 开始三端取消对比")
     conn = get_connection()
-    cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    cutoff = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
 
-    # ---- 前置步骤：刷新 platform_state ----
+    # ---- Step 1: 拉蓝盟已取消订单 ----
+    lanmong_cancelled = {}  # {orderNo: state}
     if lanmong:
-        await _refresh_cancelled_states(conn, lanmong, cutoff)
+        try:
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            resp = await lanmong.get_deliver_orders(
+                state="-2,-3,-4",
+                supplier_update_time_start=cutoff,
+                supplier_update_time_end=now_str,
+                page_size=200,
+            )
+            resp_data = resp.get("data", {})
+            orders = (resp_data.get("orderList", [])
+                      if isinstance(resp_data, dict)
+                      else (resp_data if isinstance(resp_data, list) else []))
+            for o in orders:
+                no = o.get("orderNo", "")
+                st = o.get("state")
+                if no and st is not None:
+                    lanmong_cancelled[no] = st
+            logger.info(f"[cron-c] 蓝盟已取消 {len(lanmong_cancelled)} 条")
+        except Exception as e:
+            logger.warning(f"[cron-c] 拉蓝盟取消失败: {e}")
 
-    # ---- 原有取消逻辑 ----
-    rows = conn.execute(
-        """SELECT id, platform_order_no, jky_trade_no, platform_state,
-                  state, logistic_no, retry_count, last_error
-        FROM order_map
-        WHERE jky_trade_no IS NOT NULL
-          AND platform_state IN (-2, -3, -4)
-          AND closed_at IS NULL
-          AND updated_at > datetime('now', '-30 days')
-          AND (
-            -- 路径 1: 未发货待取消 (jky_created)
-            state = 'jky_created'
-            -- 路径 2: P0 边界 — 已发货但中台已退 (logistic_no 非空 + 已发货状态)
-            OR (logistic_no IS NOT NULL AND state IN ('jky_shipped', 'synced', 'done'))
-          )
-        ORDER BY updated_at ASC
-        LIMIT 50"""
+    # ---- Step 2: 拉 JKY 全量（15天窗口）用于取消检测+拆合单识别 ----
+    all_jky = {}   # {tradeNo or onlineTradeNo: trade_data}
+    jky_cancelled_ts = {}  # {tradeNo or onlineTradeNo: tradeStatus} 仅真正取消（非拆合单）
+    try:
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        jky_cutoff = (datetime.now() - timedelta(days=JKY_LOOKBACK_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+        scroll_id = ""
+        while True:
+            resp = await jky.trade_list({
+                "scrollId": scroll_id,
+                "pageSize": 200,
+                "startModified": jky_cutoff,
+                "endModified": now_str,
+                "shopIds": JKY_SHOP_IDS,
+                "fields": "tradeNo,onlineTradeNo,tradeStatus,tradeStatusExplain,mainPostid,scrollId",
+            })
+            if resp.get("code") not in (0, 200):
+                break
+            trades = resp.get("result", {}).get("data", {}).get("trades", [])
+            if not trades:
+                break
+            for t in trades:
+                key = t.get("onlineTradeNo") or t.get("tradeNo", "")
+                if key:
+                    all_jky[key] = t
+            scroll_id = resp.get("result", {}).get("data", {}).get("scrollId", "")
+            if not scroll_id or len(trades) < 200:
+                break
+
+        successor_index = {}
+        for t_data in all_jky.values():
+            ts = str(t_data.get("tradeStatus", "") or "")
+            if ts == "5020":
+                continue
+            online_parts = [p.strip() for p in t_data.get("onlineTradeNo", "").split(",") if p.strip()]
+            if len(online_parts) > 1:
+                for part in online_parts:
+                    successor_index.setdefault(part, []).append(t_data)
+
+        # 从全量中筛选出确实取消的单（5010/5020/5030/4122, 排除被拆合单的 5020）
+        cancelled_ts_filter = {"5010", "5020", "5030", "4122"}
+        for key, t_data in all_jky.items():
+            ts = str(t_data.get("tradeStatus", ""))
+            if ts not in cancelled_ts_filter:
+                continue
+            # 5020 需要检查是否是拆合单
+            if ts == "5020":
+                platform_no = str(t_data.get("onlineTradeNo", "") or key)
+                resolved = resolve_jky_effective_state(t_data, platform_no, all_jky, successor_index)
+                if resolved["successor_trade_nos"]:
+                    logger.debug(f"[cron-c] {key} 是拆合单原单, 跳过取消检测")
+                    continue
+            jky_cancelled_ts[key] = ts
+
+        logger.info(f"[cron-c] JKY 全量 {len(all_jky)} 条, 其中已取消 {len(jky_cancelled_ts)} 条")
+    except Exception as e:
+        logger.warning(f"[cron-c] 拉 JKY 全量失败: {e}")
+
+    # ---- Step 3: 查 DB 匹配订单 ----
+    db_rows = conn.execute(
+        "SELECT id, platform_order_no, jky_trade_no, state, platform_unified, jky_unified, "
+        "jky_effective_unified, bridge_unified "
+        "FROM order_map WHERE updated_at >= ? ORDER BY id ASC", (cutoff,)
     ).fetchall()
 
-    if not rows:
-        logger.info("[cron-c] 无待取消订单")
-        return
+    # 建立索引
+    order_no_to_row = {r["platform_order_no"]: dict(r) for r in db_rows}
+    trade_no_to_row = {r["jky_trade_no"]: dict(r) for r in db_rows if r["jky_trade_no"]}
 
-    logger.info(f"[cron-c] 发现 {len(rows)} 条待取消订单")
-    for row in rows:
-        map_id = row["id"]
-        order_no = row["platform_order_no"]
-        jky_trade_no = row["jky_trade_no"]
-        platform_state = row["platform_state"]
-        current_state = row["state"]
-        logistic_no = row["logistic_no"]
+    # 建立 all_jky 的 tradeNo 索引（用于从 jky_trade_no 反查 JKY 数据）
+    trade_no_to_jky = {}
+    for t in all_jky.values():
+        tn = str(t.get("tradeNo", "") or "")
+        if tn:
+            trade_no_to_jky[tn] = t
 
-        # 🆕 P0 边界 (PRD §9.1): 已发货订单不调 cancel, 直接 P0 飞书告警
-        if logistic_no and current_state in SHIPPED_STATES:
-            logger.warning(
-                f"[cron-c] P0 边界: {order_no}({jky_trade_no}) 已发货 "
-                f"(logistic_no={logistic_no}, state={current_state}) "
-                f"但中台已退 (state={platform_state}) → 跳过 cancel, P0 告警"
+    # ---- Step 4: 蓝盟取消 → JKY 未取消 → 调 JKY cancel ----
+    for order_no, lm_state in lanmong_cancelled.items():
+        row = order_no_to_row.get(order_no)
+        if not row or not row["jky_trade_no"]:
+            continue
+        # 蓝盟已取消但 bridge 未取消
+        if row["state"] in (STATE_JKY_CANCELLED, "cancelled"):
+            continue
+
+        # 拆合单保护：如果该单的后继单已发货，跳过取消
+        # 场景：蓝盟原单被取消（-2），但 JKY 已合并到后继单且后继单已发货
+        # cron-c 不应因为原单取消就去取消后继单
+        jky_trade = trade_no_to_jky.get(row["jky_trade_no"])
+        if jky_trade:
+            resolved = resolve_jky_effective_state(
+                jky_trade, order_no, all_jky, successor_index
             )
-            await notifier.alert_p0(
-                order_no,
-                f"中台 state={platform_state} 已退, 但吉客云已发货 "
-                f"(logistic_no={logistic_no}, state={current_state}); "
-                f"资损风险, 立即人工处理",
-                map_id,
-                current_state,
-            )
-            continue  # 不调 cancel, 直接下一条
-
-        # 调 JKY 取消 (仅 jky_created 未发货订单)
-        retry = RetryState()
-        success = False
-        while not retry.is_exhausted and not success:
-            try:
-                cancel_resp = await jky.trade_cancel({"tradeNos": jky_trade_no})
-                # JKY OTS: code=200 成功
-                if cancel_resp.get("code") in (0, 200):
-                    transition(map_id, STATE_JKY_CANCELLED, "cron_c")
-                    logger.info(
-                        f"[cron-c] {order_no}({jky_trade_no}) 取消成功 "
-                        f"(中台 state={platform_state})"
-                    )
-                    success = True
-                else:
-                    error = cancel_resp.get("msg", "JKY 取消失败")
-                    retry.record_attempt(error)
-                    logger.warning(
-                        f"[cron-c] {order_no} 取消失败 (retry={retry.attempt}): {error}"
-                    )
-            except Exception as e:
-                retry.record_attempt(str(e))
-                logger.warning(
-                    f"[cron-c] {order_no} 取消异常 (retry={retry.attempt}): {e}"
+            if resolved.get("successor_trade_nos") and resolved.get("effective_unified") in (
+                "已发货", "已完成"
+            ):
+                logger.info(
+                    f"[cron-c] {order_no} 是拆合单原单，后继单已发货，跳过取消"
                 )
+                continue
 
-        if not success:
-            conn.execute(
-                """UPDATE order_map SET retry_count = ?, last_error = ?
-                WHERE id = ?""",
-                (retry.attempt, retry.last_error, map_id),
-            )
-            conn.commit()
-            transition(map_id, STATE_FAILED, "cron_c", retry.last_error)
-            await notifier.alert_p1(
-                order_no,
-                retry.last_error or f"中台 state={platform_state} 取消失败",
-                retry.attempt,
-                map_id,
-            )
+        jky_trade_no = row["jky_trade_no"]
+        logger.info(f"[cron-c] {order_no}({jky_trade_no}) 蓝盟已取消，调 JKY cancel")
+        try:
+            cancel_resp = await jky.trade_cancel({"tradeNos": jky_trade_no, "cancelReason": "420001"})
+            if cancel_resp.get("code") in (0, 200):
+                new_jky_unified = "已取消/退款"
+                new_br_unified = new_jky_unified  # bridge 跟随 JKY
+                new_platform_unified = platform_to_unified(lm_state)
+                conn.execute(
+                    "UPDATE order_map SET jky_unified = ?, jky_effective_unified = ?, "
+                    "bridge_unified = ?, platform_unified = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (new_jky_unified, new_jky_unified, new_br_unified, new_platform_unified, row["id"]),
+                )
+                conn.commit()
+                st_transition(row["id"], STATE_JKY_CANCELLED, "cron_c")
+                logger.info(f"[cron-c] {order_no} JKY 取消成功")
+            else:
+                logger.warning(f"[cron-c] {order_no} JKY 取消失败: {cancel_resp}")
+        except Exception as e:
+            logger.warning(f"[cron-c] {order_no} JKY 取消异常: {e}")
+
+    # ---- Step 5: JKY 取消 → 蓝盟正常 → 飞书告警（P0 资损风险）----
+    for key, jky_ts in jky_cancelled_ts.items():
+        # 先查 onlineTradeNo，再查 tradeNo
+        row = order_no_to_row.get(key) or trade_no_to_row.get(key)
+        if not row:
+            continue
+        try:
+            lm_unified = row.get("platform_unified") or ""
+        except Exception:
+            lm_unified = ""
+        if lm_unified in ("已取消/退款",):
+            continue  # 蓝盟也已取消 → 正常
+
+        # JKY 已取消但蓝盟正常 → 告警
+        logger.warning(
+            f"[cron-c] P0: {row['platform_order_no']} JKY(jky_ts={jky_ts}) "
+            f"已取消但蓝盟(lm_unified={lm_unified})正常"
+        )
+        await notifier.alert_p0(
+            row["platform_order_no"],
+            f"JKY tradeStatus={jky_ts} 已取消, 但蓝盟平台态={lm_unified} 正常; "
+            f"请确认订单是否需要人工处理",
+            row["id"], row["state"],
+        )
 
     logger.info("[cron-c] 完成")

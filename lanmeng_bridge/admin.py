@@ -4,9 +4,10 @@ import json
 import logging
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Query, Request, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
 
+from .auth import get_current_user
 from .storage.db import get_connection
 
 logger = logging.getLogger(__name__)
@@ -77,12 +78,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <p class="desc">蓝盟-吉客云云桥接服务 · 运行状态 & API 日志查询 & 三态对账</p>
 
 <div class="tab-bar">
-  <div class="tab active" onclick="switchTab('crons')">📊 Cron 状态</div>
+  <div class="tab active" onclick="switchTab('recon')">🔄 对账</div>
+  <div class="tab" onclick="switchTab('crons')">📊 Cron 状态</div>
   <div class="tab" onclick="switchTab('logs')">📝 API 日志</div>
-  <div class="tab" onclick="switchTab('recon')">🔄 对账</div>
 </div>
 
-<div id="panel-crons" class="panel active">
+<div id="panel-crons" class="panel">
   <div class="stat-grid" id="cron-stats"></div>
   <h2>Cron 游标</h2>
   <table><thead><tr><th>Key</th><th>值</th><th>更新于</th></tr></thead>
@@ -97,15 +98,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <label>来源 <select id="f-source"><option value="">全部</option><option>lanmong</option><option>jky_gateway</option><option>jky_direct</option></select></label>
     <label>方法 <input id="f-method" placeholder="method 关键词" style="width:140px"></label>
     <label>结果 <select id="f-status"><option value="">全部</option><option value="ok">成功</option><option value="err">失败</option></select></label>
+    <label>搜索 <input id="f-q" placeholder="订单号/单号/关键字" style="width:160px"></label>
     <label>每页 <select id="f-size"><option>20</option><option selected>50</option><option>100</option></select></label>
     <button onclick="loadLogs(1)" style="background:#238636;border:none;color:#fff;padding:4px 14px;border-radius:4px;cursor:pointer;font-size:12px">查询</button>
   </div>
-  <table><thead><tr><th>ID</th><th>来源</th><th>方法</th><th>HTTP</th><th>业务码</th><th>耗时</th><th>请求体</th><th>响应体</th><th>时间</th></tr></thead>
+  <table><thead><tr><th>ID</th><th>来源</th><th>方法</th><th>HTTP</th><th>业务码</th><th>结果</th><th>耗时</th><th>请求体</th><th>响应体</th><th>错误</th><th>时间</th></tr></thead>
   <tbody id="log-rows"></tbody></table>
   <div class="pagination"><span id="log-info"></span><div><button id="log-prev" onclick="loadLogs(curPage-1)">← 上一页</button><span id="log-page" style="margin:0 10px"></span><button id="log-next" onclick="loadLogs(curPage+1)">下一页 →</button></div></div>
 </div>
 
-<div id="panel-recon" class="panel">
+<div id="panel-recon" class="panel active">
   <div class="sub-tab-bar" style="display:flex;gap:4px;margin-bottom:12px">
     <div class="sub-tab active" onclick="switchReconSub('pending')">📋 待处理</div>
     <div class="sub-tab" onclick="switchReconSub('report')">📊 日报</div>
@@ -114,7 +116,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div id="recon-sub-pending">
     <div class="stat-grid" id="recon-stats"></div>
     <div class="action-bar">
-      <button id="recon-resubmit" onclick="resubmitSelected()" disabled>🔄 重新提交选中</button>
+      <select id="recon-filter" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 10px;border-radius:4px;font-size:12px">
+        <option value="all">全部状态</option>
+        <option value="consistent">✅ 一致</option>
+        <option value="inconsistent">❌ 不一致</option>
+      </select>
+      <select id="recon-action" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 10px;border-radius:4px;font-size:12px">
+      </select>
+      <button id="recon-resubmit" onclick="doAction()" disabled>执行</button>
       <span class="count" id="recon-count">已选 0 条</span>
       <span style="flex:1"></span>
       <button onclick="loadRecon()" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px">刷新</button>
@@ -122,7 +131,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div id="recon-result"></div>
     <table><thead><tr>
       <th style="width:30px"><input type="checkbox" id="recon-select-all" onchange="toggleAll()"></th>
-      <th>ID</th><th>平台单号</th><th>Bridge 状态</th><th>平台态</th><th>吉客云单号</th><th>物流单号</th><th>差异标记</th><th>错误/备注</th><th>更新于</th>
+      <th>ID</th><th>平台单号</th><th>🟢 蓝盟</th><th>🔷 桥(DB)</th><th>🔴 吉客云</th><th>三端一致</th><th>吉客云单号</th><th>物流单号</th><th>错误/备注</th><th>更新于</th>
     </tr></thead>
     <tbody id="recon-rows"></tbody></table>
   </div>
@@ -165,12 +174,30 @@ function stateBadge(s){
     'static':'badge-ok'}
   return'<span class="badge '+(m[s]||'badge-warn')+'">'+s+'</span>'
 }
+function unifiedBadge(label){
+  const clss={'待发货':'badge-init','部分发货':'badge-warn','已发货':'badge-ok','已完成':'badge-ok','已取消/退款':'badge-err'};
+  return'<span class="badge '+(clss[label]||'badge-warn')+'">'+(label||'?')+'</span>'
+}
+function stateLabelBadge(label, raw){
+  // 根据原始值决定颜色: 取消/异常/失败 = 红色, 初始/待处理 = 黄色, done/ok = 绿色
+  const n=parseInt(raw); let cls='badge-ok';
+  if(raw==='init'||raw==='failed'||(n<0))cls='badge-err';
+  else if(raw==='jky_created'||raw==='audited'||raw==='待发货'||raw==='初始')cls='badge-warn';
+  else if(label==='未创建')cls='badge-init';
+  return'<span class="badge '+cls+'">'+label+'</span>'
+}
 function driftBadge(d){
   const m={'lanmeng_cancel':'badge-err','stale_24h':'badge-warn','stale_48h':'badge-err','failed':'badge-err','pending':'badge-warn','init':'badge-init'}
   return'<span class="badge '+(m[d]||'badge-warn')+'">'+d+'</span>'
 }
 function durStr(ms){if(!ms)return'-';if(ms<1000)return ms+'ms';return(ms/1e3).toFixed(1)+'s'}
-function timeStr(t){if(!t)return'-';return t.replace('T',' ').slice(0,19)}
+function resultBadge(ok){return ok?'<span class="badge badge-ok">✅ 成功</span>':'<span class="badge badge-err">❌ 失败</span>'}
+function timeStr(t){
+  if(!t)return'-';
+  const d=new Date((t.replace(' ','T')||'')+'Z');
+  if(isNaN(d.getTime()))return t.slice(0,19);
+  return d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}).replace(/\//g,'-');
+}
 function trunc(s,l){if(!s)return'-';s=s.slice(0,l);return s}
 
 async function loadCrons(){
@@ -187,11 +214,13 @@ async function loadLogs(page){
   const src=document.getElementById('f-source').value;
   const method=document.getElementById('f-method').value;
   const status=document.getElementById('f-status').value;
+  const q=document.getElementById('f-q').value;
   const size=document.getElementById('f-size').value;
   const params=new URLSearchParams({page:curPage,page_size:size});
   if(src)params.set('source',src);
   if(method)params.set('method',method);
   if(status)params.set('status',status);
+  if(q)params.set('q',q);
   try{
     const r=await(await fetch('/admin/api/logs?'+params)).json();
     totalPages=r.total_pages;
@@ -201,11 +230,13 @@ async function loadLogs(page){
       '<td class="code">'+l.method+'</td>'+
       '<td>'+statusBadge(l.http_status)+'</td>'+
       '<td>'+apiCodeBadge(l.api_code)+'</td>'+
+      '<td>'+resultBadge(l.is_success)+'</td>'+
       '<td>'+durStr(l.duration_ms)+'</td>'+
-      '<td><button class="expand-btn" onclick="showBody('+JSON.stringify(trunc(l.request_body,200)).replace(/\"/g,'&quot;')+')">查看</button></td>'+
-      '<td><button class="expand-btn" onclick="showBody('+JSON.stringify(trunc(l.response_body,200)).replace(/\"/g,'&quot;')+')">查看</button></td>'+
+      '<td>'+(l.request_body?'<button class="expand-btn" onclick="showBody(this.dataset.body)" data-body="'+(l.request_body.slice(0,200).replace(/"/g,'&quot;'))+'">查看</button>':'-')+'</td>'+
+      '<td>'+(l.response_body?'<button class="expand-btn" onclick="showBody(this.dataset.body)" data-body="'+(l.response_body.slice(0,200).replace(/"/g,'&quot;'))+'">查看</button>':'-')+'</td>'+
+      '<td class="ttl" style="max-width:120px;overflow:hidden;text-overflow:ellipsis">'+(l.error||'')+'</td>'+
       '<td class="ttl">'+timeStr(l.created_at)+'</td>'+
-    '</tr>').join('')||'<tr><td colspan="9" class="empty">无匹配日志</td></tr>';
+    '</tr>').join('')||'<tr><td colspan="11" class="empty">无匹配日志</td></tr>';
     document.getElementById('log-info').textContent='共 '+r.total+' 条';
     document.getElementById('log-page').textContent='第 '+curPage+'/'+totalPages+' 页';
     document.getElementById('log-prev').disabled=curPage<=1;
@@ -217,25 +248,40 @@ async function loadRecon(){
   try{
     const r=await(await fetch('/admin/api/reconciliation')).json();
     reconData=r.orders;
-    // stats
+    // 五态统计 (以 bridge_unified 为准)
+    const FIVE_STATES=['待发货','部分发货','已发货','已完成','已取消/退款'];
+    const counts={};let total=r.orders.length;
+    FIVE_STATES.forEach(s=>counts[s]={total:0,consistent:0,inconsistent:0});
+    let consistentCount=0,inconsistentCount=0;
+    r.orders.forEach(o=>{
+      const s=o.bridge_unified||'待发货';
+      if(!counts[s])counts[s]={total:0,consistent:0,inconsistent:0};
+      counts[s].total++;
+      if(o.consistent){counts[s].consistent++;consistentCount++}
+      else{counts[s].inconsistent++;inconsistentCount++}
+    });
     document.getElementById('recon-stats').innerHTML=
-      '<div class="stat-card"><div class="num">'+r.total+'</div><div class="label">订单总数 (30d)</div></div>'+
-      '<div class="stat-card"><div class="num '+('red' in r.summary?'yellow':'')+'">'+r.summary.pending+'</div><div class="label">待处理</div></div>'+
-      '<div class="stat-card"><div class="num '+('red' in r.summary?'red':'')+'">'+r.summary.inconsistent+'</div><div class="label">差异数</div></div>'+
-      '<div class="stat-card"><div class="num">'+r.summary.terminal+'</div><div class="label">已完成</div></div>';
+      '<div class="stat-card"><div class="num">'+total+'</div><div class="label">订单总数</div></div>'+
+      FIVE_STATES.map(s=>'<div class="stat-card"><div class="num '+(counts[s]?.inconsistent>0?'red':'')+'">'+(counts[s]?.total||0)+
+        '</div><div class="label">'+s+'</div></div>').join('')+
+      '<div class="stat-card"><div class="num">'+consistentCount+'</div><div class="label">一致</div></div>'+
+      '<div class="stat-card"><div class="num '+(inconsistentCount>0?'red':'')+'">'+inconsistentCount+'</div><div class="label">不一致</div></div>';
     // rows
     document.getElementById('recon-rows').innerHTML=r.orders.map((o,i)=>'<tr id="recon-tr-'+o.id+'" onclick="toggleRow('+o.id+')">'+
       '<td><input type="checkbox" class="recon-cb" data-id="'+o.id+'" onchange="toggleRow('+o.id+')" '+(selectedIds.has(o.id)?'checked':'')+'></td>'+
       '<td class="ttl">'+o.id+'</td>'+
       '<td class="code">'+o.platform_order_no+'</td>'+
-      '<td>'+stateBadge(o.state)+'</td>'+
-      '<td>'+o.platform_state+'</td>'+
+      '<td>'+unifiedBadge(o.platform_unified)+'</td>'+
+      '<td>'+unifiedBadge(o.bridge_unified)+'</td>'+
+      '<td>'+unifiedBadge(o.jky_unified)+'</td>'+
+      '<td>'+(o.consistent
+        ?'<span class="badge badge-ok">一致</span>'
+        :'<span class="badge badge-err">不一致</span>')+'</td>'+
       '<td class="code">'+(o.jky_trade_no||'-')+'</td>'+
       '<td class="code">'+(o.logistic_no||'-')+'</td>'+
-      '<td>'+(o.drift_flags||[]).map(driftBadge).join(' ')+'</td>'+
-      '<td class="ttl" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">'+(o.last_error||'')+'</td>'+
+      '<td class="ttl" style="max-width:180px;overflow:hidden;text-overflow:ellipsis">'+(o.last_error||'')+'</td>'+
       '<td class="ttl">'+timeStr(o.updated_at)+'</td>'+
-    '</tr>').join('')||'<tr><td colspan="10" class="empty">无待处理订单</td></tr>';
+    '</tr>').join('')||'<tr><td colspan="11" class="empty">无待处理订单</td></tr>';
   }catch(e){document.getElementById('recon-rows').innerHTML='<tr><td colspan="10" class="empty">加载失败: '+e.message+'</td></tr>'}
 }
 
@@ -255,21 +301,51 @@ function updateCount(){
   document.getElementById('recon-resubmit').disabled=selectedIds.size===0;
 }
 
-async function resubmitSelected(){
+const ACTION_OPTIONS=[
+  {value:'pull-lanmong',label:'📥 从蓝盟重新拉取'},
+  {value:'resubmit-jky',label:'🚀 重新提交到吉客云'},
+  {value:'pull-jky',label:'📥 从吉客云重新拉取'},
+  {value:'resubmit-lanmong',label:'🚀 回传蓝盟（物流同步）'},
+];
+const ACTION_URLS={
+  'pull-lanmong':'/admin/api/reconciliation/pull-lanmong',
+  'resubmit-jky':'/admin/api/reconciliation/resubmit',
+  'pull-jky':'/admin/api/reconciliation/pull-jky',
+  'resubmit-lanmong':'/admin/api/reconciliation/resubmit-lanmong',
+};
+
+function updateActionSelect(){
+  if(selectedIds.size===0){document.getElementById('recon-action').innerHTML='<option value="">— 请先选择订单 —</option>';return}
+  // 统计选中订单的推荐操作
+  const counts={};
+  reconData.forEach(o=>{if(selectedIds.has(o.id)){const a=o.suggested_action||'pull-lanmong';counts[a]=(counts[a]||0)+1}});
+  const best=Object.entries(counts).sort((a,b)=>b[1]-a[1])[0][0];
+  // 按推荐顺序生成选项
+  const ordered=['pull-lanmong','resubmit-jky','pull-jky','resubmit-lanmong'];
+  document.getElementById('recon-action').innerHTML=ordered.map(v=>{
+    const label=ACTION_OPTIONS.find(o=>o.value===v)?.label||v;
+    return'<option value="'+v+'"'+(v===best?' selected':'')+(counts[v]?'':'')+'>'+label+'</option>'
+  }).join('');
+}
+
+async function doAction(){
   if(selectedIds.size===0)return;
   const ids=Array.from(selectedIds);
+  const action=document.getElementById('recon-action').value;
+  if(!action||!ACTION_URLS[action])return;
+  const label=ACTION_OPTIONS.find(o=>o.value===action)?.label||action;
   document.getElementById('recon-resubmit').disabled=true;
-  document.getElementById('recon-result').innerHTML='<div class="result-msg ok">提交中 ('+ids.length+' 条)...</div>';
+  document.getElementById('recon-result').innerHTML='<div class="result-msg ok">'+label+'中 ('+ids.length+' 条)...</div>';
   try{
-    const r=await(await fetch('/admin/api/reconciliation/resubmit',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
+    const r=await(await fetch(ACTION_URLS[action],{
+      method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({ids}),
     })).json();
     const ok=r.results.filter(x=>x.success).length;
     const fail=r.results.filter(x=>!x.success).length;
+    const msgs=r.results.filter(x=>x.msg).map(x=>x.msg).slice(0,3).join('; ');
     document.getElementById('recon-result').innerHTML=
-      '<div class="result-msg '+(fail?'err':'ok')+'">处理完成: '+ok+' 成功, '+fail+' 失败</div>';
+      '<div class="result-msg '+(fail?'err':'ok')+'">'+label+'完成: '+ok+' 成功, '+fail+' 失败'+(msgs?'<br><span style="font-size:11px">'+msgs+'</span>':'')+'</div>';
     selectedIds.clear();
     updateCount();
     setTimeout(loadRecon,1000);
@@ -279,7 +355,14 @@ async function resubmitSelected(){
   }
 }
 
-document.addEventListener('DOMContentLoaded',()=>{loadCrons();loadLogs(1)});
+function updateCount(){
+  document.getElementById('recon-count').textContent='已选 '+selectedIds.size+' 条';
+  document.getElementById('recon-resubmit').disabled=selectedIds.size===0;
+  updateActionSelect();
+}
+
+document.addEventListener('DOMContentLoaded',()=>{loadRecon();loadCrons();loadLogs(1)});
+document.getElementById('recon-filter')?.addEventListener('change',loadRecon);
 
 // 对账子 tab
 function switchReconSub(name){
@@ -345,31 +428,47 @@ async function loadReports(){
 
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
-async def admin_index():
-    return DASHBOARD_HTML
+async def admin_index(request: Request):
+    user = await get_current_user(request)
+    if not user:
+        return RedirectResponse(url="/admin/auth/login")
+    # 注入用户信息到 dashboard
+    html = DASHBOARD_HTML.replace(
+        '</h1>',
+        f'</h1> <span style="font-size:12px;color:#8b949e;margin-left:12px">'
+        f'{user.get("name","")} · <a href="/admin/auth/logout" '
+        f'style="color:#8b949e;text-decoration:underline">退出</a></span>',
+        1,
+    )
+    return html
 
 
 @router.get("/api/crons")
-async def api_cron_status():
+async def api_cron_status(request: Request):
     """Cron status: cursors + recent API calls"""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401)
     conn = get_connection()
     cursors = conn.execute(
         "SELECT cursor_key, cursor_value, updated_at FROM cron_cursor ORDER BY cursor_key"
     ).fetchall()
 
     # Recent API calls (last 20 across all sources)
-    today = datetime.now().strftime("%Y-%m-%d")
+    # Use SQLite's datetime('now') which returns UTC, matching DB timestamps
+    today = "datetime('now', 'start of day')"
     recent = conn.execute(
         """SELECT source, method, http_status, api_code, duration_ms, created_at
            FROM api_call_log
-           WHERE created_at >= ?
+           WHERE created_at >= """
+        + today
+        + """
            ORDER BY id DESC LIMIT 20""",
-        (today,),
     ).fetchall()
 
     today_count = conn.execute(
-        "SELECT COUNT(*) FROM api_call_log WHERE created_at >= ?",
-        (today,),
+        "SELECT COUNT(*) FROM api_call_log WHERE created_at >= "
+        + today
     ).fetchone()[0]
 
     return {
@@ -395,14 +494,19 @@ async def api_cron_status():
 
 @router.get("/api/logs")
 async def api_logs(
+    request: Request,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     source: str = Query("", max_length=32),
     method: str = Query("", max_length=128),
     status: str = Query("", pattern="^(ok|err|)$"),
+    q: str = Query("", max_length=128),
     days: int = Query(7, ge=1, le=90),
 ):
     """Paginated API call log query"""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401)
     conn = get_connection()
     where = ["created_at >= datetime('now', ?)"]
     params = [f"-{days} days"]
@@ -413,10 +517,14 @@ async def api_logs(
     if method:
         where.append("method LIKE ?")
         params.append(f"%{method}%")
+    if q:
+        where.append("(request_body LIKE ? OR response_body LIKE ? OR method LIKE ?)")
+        like = f"%{q}%"
+        params.extend([like, like, like])
     if status == "ok":
-        where.append("http_status >= 200 AND http_status < 300 AND (api_code = 0 OR api_code = 200)")
+        where.append("(http_status >= 200 AND http_status < 300 AND (api_code = 0 OR api_code = 200) AND (error IS NULL OR error = ''))")
     elif status == "err":
-        where.append("http_status = 0 OR http_status >= 400 OR (api_code != 0 AND api_code != 200)")
+        where.append("http_status = 0 OR http_status >= 400 OR (api_code != 0 AND api_code != 200) OR (error IS NOT NULL AND error != '')")
 
     where_clause = " AND ".join(where)
 
@@ -429,9 +537,9 @@ async def api_logs(
 
     rows = conn.execute(
         f"""SELECT id, source, method, http_status, api_code, api_sub_code,
-                   substr(request_body, 1, 200) AS request_body,
-                   substr(response_body, 1, 200) AS response_body,
-                   duration_ms, created_at
+                   substr(request_body, 1, 800) AS request_body,
+                   substr(response_body, 1, 800) AS response_body,
+                   duration_ms, error, created_at
             FROM api_call_log
             WHERE {where_clause}
             ORDER BY id DESC
@@ -455,7 +563,13 @@ async def api_logs(
                 "request_body": r["request_body"],
                 "response_body": r["response_body"],
                 "duration_ms": r["duration_ms"],
+                "error": r["error"] or "",
                 "created_at": r["created_at"],
+                "is_success": bool(
+                    200 <= (r["http_status"] or 0) < 300
+                    and (r["api_code"] or 0) in (0, 200)
+                    and not (r["error"] or "")
+                ),
             }
             for r in rows
         ],
@@ -521,15 +635,73 @@ def _classify_drift(row: dict) -> tuple[list[str], str]:
     return (flags, priority)
 
 
+@router.get("/api/debug")
+async def api_debug(request: Request):
+    """调试：返回请求的 cookies 和 headers"""
+    return {
+        "cookies": dict(request.cookies),
+        "has_session_cookie": "admin_session" in request.cookies,
+    }
+
+
 @router.get("/api/reconciliation")
-async def api_reconciliation():
-    """三态对账：列出不一致/待处理的订单"""
+async def api_reconciliation(request: Request):
+    """三态对账：列出不一致/待处理的订单
+
+    前置刷新：拉蓝盟近期已取消订单，更新 platform_state
+    确保对账页面能看到蓝盟侧最新状态而非首次插入时的快照。
+    """
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401)
     conn = get_connection()
     cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
 
+    # ---- 前置刷新：拉蓝盟近期已取消订单，更新 platform_state ----
+    lanmong_actual = {}  # {orderNo: lanmong_state}
+    lanmong = getattr(request.app.state, "lanmong_client", None)
+    if lanmong:
+        try:
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            resp = await lanmong.get_deliver_orders(
+                state="-2",
+                supplier_update_time_start=cutoff,
+                supplier_update_time_end=now_str,
+                page_size=200,
+            )
+            resp_data = resp.get("data", {})
+            if isinstance(resp_data, dict):
+                orders = resp_data.get("orderList", [])
+            else:
+                orders = resp_data if isinstance(resp_data, list) else []
+            for o in orders:
+                order_no = o.get("orderNo", "")
+                st = o.get("state")
+                if order_no and st is not None:
+                    lanmong_actual[order_no] = st
+            # 更新 DB 中停滞的 platform_state
+            if lanmong_actual:
+                db_check = conn.execute(
+                    "SELECT id, platform_order_no, platform_state, state FROM order_map "
+                    "WHERE updated_at >= ?", (cutoff,)
+                ).fetchall()
+                for r in db_check:
+                    no = r["platform_order_no"]
+                    if no in lanmong_actual and r["platform_state"] != lanmong_actual[no]:
+                        conn.execute(
+                            "UPDATE order_map SET platform_state = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (lanmong_actual[no], r["id"]),
+                        )
+                        logger.info(f"[recon] 刷新 {no} platform_state {r['platform_state']} → {lanmong_actual[no]}")
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"[recon] 蓝盟刷新失败（非致命）: {e}")
+
+    # ---- 查询 DB ----
     rows = conn.execute(
         """SELECT id, platform_order_no, platform_state, jky_trade_no,
-                  logistic_no, state, retry_count, last_error, updated_at
+                  logistic_no, state, retry_count, last_error, updated_at,
+                  platform_unified, jky_unified, jky_effective_unified, bridge_unified, jky_state
            FROM order_map
            WHERE updated_at >= ?
            ORDER BY
@@ -547,19 +719,34 @@ async def api_reconciliation():
     orders = []
     summary = {"pending": 0, "inconsistent": 0, "terminal": 0}
     for r in rows:
-        flags, priority = _classify_drift(r)
+        # 用实际蓝盟态（如有）替代 DB 中的 platform_state
+        actual_lanmong = lanmong_actual.get(r["platform_order_no"], r["platform_state"])
+        row_dict = dict(r)
+        row_dict["platform_state"] = actual_lanmong
+
+        flags, priority = _classify_drift(row_dict)
+        # 推荐操作
+        suggested = _suggest_action(r["state"], actual_lanmong, r["jky_trade_no"], r["logistic_no"])
         entry = {
             "id": r["id"],
             "platform_order_no": r["platform_order_no"],
             "platform_state": r["platform_state"],
+            "jky_state": r["jky_state"],
             "jky_trade_no": r["jky_trade_no"],
             "logistic_no": r["logistic_no"],
             "state": r["state"],
             "retry_count": r["retry_count"],
             "last_error": r["last_error"],
             "updated_at": str(r["updated_at"]) if r["updated_at"] else None,
-            "drift_flags": flags,
-            "drift_priority": priority,
+            # 统一态字段
+            "platform_unified": r["platform_unified"] or _lanmong_label(r["platform_state"]),
+            "bridge_unified": r["bridge_unified"] or _bridge_label(r["state"]),
+            "jky_unified": r["jky_effective_unified"] or r["jky_unified"] or "待发货",
+            "consistent": (
+                (r["platform_unified"] or _lanmong_label(r["platform_state"]))
+                == (r["bridge_unified"] or _bridge_label(r["state"]))
+                == (r["jky_effective_unified"] or r["jky_unified"] or "待发货")
+            ),
         }
         orders.append(entry)
         if priority == "terminal":
@@ -576,9 +763,298 @@ async def api_reconciliation():
     }
 
 
+# ---- 三端状态标签 & 一致性判断 ----
+
+_LANMONG_LABELS = {
+    1: "待审核", 2: "待发货", 4: "已发货",
+    -2: "已取消", -3: "异常", -4: "退款",
+}
+_BRIDGE_LABELS = {
+    "init": "初始", "failed": "失败",
+    "jky_created": "已创单", "audited": "待发货",
+    "jky_shipped": "JKY已发货", "synced": "已回传", "done": "已完成",
+    "cancelled": "已取消", "jky_cancelled": "JKY已取消",
+    "skipped": "跳过", "static": "静态",
+}
+
+
+def _lanmong_label(s) -> str:
+    """蓝盟状态（数字 → 中文）"""
+    try:
+        return _LANMONG_LABELS.get(int(s), f"蓝盟({s})")
+    except (ValueError, TypeError):
+        return "未知"
+
+
+def _bridge_label(s: str) -> str:
+    """Bridge 状态（英文 → 中文）"""
+    return _BRIDGE_LABELS.get(s, s)
+
+
+def _jky_label(state: str, jky_trade_no, logistic_no) -> str:
+    """吉客云状态推断"""
+    if not jky_trade_no:
+        return "未创建"
+    if state in ("jky_cancelled", "cancelled"):
+        return "已取消"
+    if state in ("done", "synced"):
+        return "已完成"
+    if logistic_no or state in ("jky_shipped",):
+        return "已发货"
+    if state in ("jky_created", "audited"):
+        return "待发货"
+    return "已创建"
+
+
+def _triple_consistent(lanmong_state, state: str, jky_trade_no, logistic_no) -> bool:
+    """三端是否一致：直接对比三端标签，完全一样才一致"""
+    lm_label = _lanmong_label(lanmong_state)
+    br_label = _bridge_label(state)
+    jk_label = _jky_label(state, jky_trade_no, logistic_no)
+    return lm_label == br_label == jk_label
+
+
+# ---- 推荐操作逻辑 ----
+
+_ACTION_LABELS = {
+    "pull-lanmong": "📥 从蓝盟重新拉取",
+    "pull-jky": "📥 从吉客云重新拉取",
+    "resubmit-jky": "🚀 重新提交到吉客云",
+    "resubmit-lanmong": "🚀 回传蓝盟（物流同步）",
+}
+
+
+def _suggest_action(
+    state: str,
+    lanmong_state,
+    jky_trade_no,
+    logistic_no,
+) -> str:
+    """根据订单当前状态推荐默认操作"""
+    # 缺 JKY 单 → 提交到吉客云
+    if state in ("init", "failed", "audited") and not jky_trade_no:
+        return "resubmit-jky"
+
+    # 蓝盟已取消但 bridge 未处理 → 从蓝盟拉取
+    if lanmong_state is not None and lanmong_state < 0 and state not in ("jky_cancelled", "cancelled"):
+        return "pull-lanmong"
+
+    # 已创建/审核但未发货 → 从吉客云拉取查看状态
+    if state in ("jky_created", "audited") and jky_trade_no:
+        return "pull-jky"
+
+    # 已闭环但蓝盟不是已发货 → 回传蓝盟
+    if state == "done" and lanmong_state != 4:
+        return "resubmit-lanmong"
+
+    # 已发货但未回传 → 回传蓝盟
+    if state in ("jky_shipped", "synced"):
+        return "resubmit-lanmong"
+
+    return "pull-lanmong"
+
+
+# ---- 操作 Endpoints ----
+
+@router.post("/api/reconciliation/pull-lanmong")
+async def api_recon_pull_lanmong(request: Request):
+    """从蓝盟重新拉取选中订单的状态"""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401)
+    body = await request.json()
+    ids = body.get("ids", [])
+    if not ids:
+        return {"success": False, "error": "no_ids", "results": []}
+
+    conn = get_connection()
+    lanmong = getattr(request.app.state, "lanmong_client", None)
+    results = []
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for order_id in ids:
+        row = conn.execute(
+            "SELECT id, platform_order_no, platform_state, state FROM order_map WHERE id = ?",
+            (order_id,),
+        ).fetchone()
+        if not row:
+            results.append({"id": order_id, "success": False, "action": "pull-lanmong", "msg": "未找到"})
+            continue
+
+        order_no = row["platform_order_no"]
+        if not lanmong:
+            results.append({"id": order_id, "success": False, "action": "pull-lanmong", "msg": "蓝盟客户端不可用"})
+            continue
+
+        try:
+            resp = await lanmong.get_deliver_orders(order_no=order_no, state=None)
+            resp_data = resp.get("data", {})
+            orders_list = resp_data.get("orderList", []) if isinstance(resp_data, dict) else (
+                resp_data if isinstance(resp_data, list) else [])
+            if not orders_list:
+                results.append({"id": order_id, "success": False, "action": "pull-lanmong", "msg": "蓝盟未返回该订单"})
+                continue
+
+            new_state = orders_list[0].get("state", row["platform_state"])
+            from ..core.shared_unified import platform_to_unified
+            new_unified = platform_to_unified(new_state)
+            conn.execute(
+                "UPDATE order_map SET platform_state = ?, platform_unified = ?, updated_at = ? WHERE id = ?",
+                (new_state, new_unified, now_str, order_id),
+            )
+            conn.commit()
+            msg = f"蓝盟实际 state={new_state} → {new_unified}"
+            if new_state < 0 and row["state"] not in ("jky_cancelled", "cancelled"):
+                msg += "（蓝盟已取消，cron-c 将自动取消 JKY）"
+            results.append({"id": order_id, "success": True, "action": "pull-lanmong", "msg": msg})
+        except Exception as e:
+            logger.exception(f"[pull-lanmong] {order_no} 失败: {e}")
+            results.append({"id": order_id, "success": False, "action": "pull-lanmong", "msg": str(e)})
+
+    return {"success": True, "results": results}
+
+
+@router.post("/api/reconciliation/pull-jky")
+async def api_recon_pull_jky(request: Request):
+    """从吉客云重新拉取选中订单的状态"""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401)
+    body = await request.json()
+    ids = body.get("ids", [])
+    if not ids:
+        return {"success": False, "error": "no_ids", "results": []}
+
+    conn = get_connection()
+    jky = getattr(request.app.state, "jky_client", None)
+    results = []
+
+    for order_id in ids:
+        row = conn.execute(
+            "SELECT id, platform_order_no, jky_trade_no, state FROM order_map WHERE id = ?",
+            (order_id,),
+        ).fetchone()
+        if not row:
+            results.append({"id": order_id, "success": False, "action": "pull-jky", "msg": "未找到"})
+            continue
+
+        trade_no = row["jky_trade_no"]
+        if not trade_no:
+            results.append({"id": order_id, "success": False, "action": "pull-jky", "msg": "该订单无 JKY 单号"})
+            continue
+        if not jky:
+            results.append({"id": order_id, "success": False, "action": "pull-jky", "msg": "JKY 客户端不可用"})
+            continue
+
+        try:
+            resp = await jky.trade_list({"tradeNos": trade_no})
+            if resp.get("code") not in (0, 200):
+                results.append({"id": order_id, "success": False, "action": "pull-jky",
+                                "msg": f"JKY 查询失败: {resp.get('msg', '')}"})
+                continue
+            data = resp.get("result", {}).get("data", {})
+            trades = data.get("trades", data.get("list", data.get("rows", [])))
+            if not trades:
+                results.append({"id": order_id, "success": False, "action": "pull-jky", "msg": "JKY 未返回该订单"})
+                continue
+            t = trades[0]
+            jky_status = t.get("tradeStatusExplain") or t.get("tradeStatus") or ""
+            jky_postid = t.get("mainPostid") or ""
+            results.append({
+                "id": order_id, "success": True, "action": "pull-jky",
+                "msg": f"JKY 状态: {jky_status}, 物流单号: {jky_postid or '无'}",
+                "data": {"tradeNo": trade_no, "status": jky_status, "mainPostid": jky_postid},
+            })
+        except Exception as e:
+            logger.exception(f"[pull-jky] {trade_no} 失败: {e}")
+            results.append({"id": order_id, "success": False, "action": "pull-jky", "msg": str(e)})
+
+    return {"success": True, "results": results}
+
+
+@router.post("/api/reconciliation/resubmit-lanmong")
+async def api_recon_resubmit_lanmong(request: Request):
+    """回传蓝盟 — 触发物流同步"""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401)
+    body = await request.json()
+    ids = body.get("ids", [])
+    if not ids:
+        return {"success": False, "error": "no_ids", "results": []}
+
+    conn = get_connection()
+    lanmong = getattr(request.app.state, "lanmong_client", None)
+    jky = getattr(request.app.state, "jky_client", None)
+    results = []
+
+    for order_id in ids:
+        row = conn.execute(
+            "SELECT id, platform_order_no, platform_order_id, jky_trade_no, state, "
+            "logistic_no, order_items_json FROM order_map WHERE id = ?",
+            (order_id,),
+        ).fetchone()
+        if not row:
+            results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": "未找到"})
+            continue
+        if not row["jky_trade_no"]:
+            results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": "缺 JKY 单号"})
+            continue
+        if not row["logistic_no"]:
+            results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": "缺物流单号，无法回传"})
+            continue
+        if not lanmong:
+            results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": "蓝盟客户端不可用"})
+            continue
+
+        try:
+            # 直接调蓝盟 syncOrderExpress 回传物流
+            order_items = []
+            if row["order_items_json"]:
+                try:
+                    products = json.loads(row["order_items_json"])
+                    order_items = [
+                        {"orderItemId": p.get("orderItemId", 0), "num": p.get("number", 1)}
+                        for p in products if p.get("orderItemId")
+                    ]
+                except Exception:
+                    pass
+
+            resp = await lanmong.sync_order_express(
+                order_id=row["platform_order_id"] or 0,
+                order_no=row["platform_order_no"],
+                express_no=row["logistic_no"],
+                express_code="STO",
+                express_name="申通快递",
+                warehouse_id=2,
+                warehouse_name="一号仓",
+                items=order_items or [{"orderItemId": 0, "num": 1}],
+            )
+
+            if resp.get("code") == 0:
+                fault_list = (resp.get("data") or {}).get("faultList") or []
+                if not fault_list:
+                    results.append({"id": order_id, "success": True, "action": "resubmit-lanmong",
+                                    "msg": f"物流已回传蓝盟: {row['logistic_no']}"})
+                else:
+                    results.append({"id": order_id, "success": False, "action": "resubmit-lanmong",
+                                    "msg": f"回传局部失败: {fault_list[0].get('errorMsg','')}"})
+            else:
+                results.append({"id": order_id, "success": False, "action": "resubmit-lanmong",
+                                "msg": f"蓝盟回传失败: {resp.get('msg','')}"})
+        except Exception as e:
+            logger.exception(f"[resubmit-lanmong] {order_id} 失败: {e}")
+            results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": str(e)})
+
+    return {"success": True, "results": results}
+
+
 @router.post("/api/reconciliation/resubmit")
 async def api_reconciliation_resubmit(request: Request):
     """重新提交选中订单 — 根据当前状态执行相应恢复操作"""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401)
     body = await request.json()
     ids = body.get("ids", [])
     if not ids:
@@ -692,7 +1168,7 @@ async def _resubmit_create(row: dict, app_state) -> dict:
 
     # Step 1: Re-fetch order from lanmong by orderNo
     try:
-        lanmong_resp = await lanmong.get_deliver_orders(order_no=platform_order_no)
+        lanmong_resp = await lanmong.get_deliver_orders(order_no=platform_order_no, state=None)
         lanmong_data = lanmong_resp.get("data", {})
         if isinstance(lanmong_data, dict):
             orders_list = lanmong_data.get("orderList", [])
@@ -804,8 +1280,11 @@ async def _resubmit_create(row: dict, app_state) -> dict:
 # ---- 对账日报 ----
 
 @router.get("/api/reconciliation/reports")
-async def api_recon_reports(limit: int = Query(10, ge=1, le=90)):
+async def api_recon_reports(request: Request, limit: int = Query(10, ge=1, le=90)):
     """列出最近的对账日报"""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401)
     conn = get_connection()
     rows = conn.execute(
         """SELECT id, report_date, run_id, summary_json, deviations_json,
@@ -830,8 +1309,11 @@ async def api_recon_reports(limit: int = Query(10, ge=1, le=90)):
 
 
 @router.get("/api/reconciliation/reports/{report_id}")
-async def api_recon_report_detail(report_id: int):
+async def api_recon_report_detail(report_id: int, request: Request):
     """获取单份对账日报的完整详情"""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401)
     conn = get_connection()
     row = conn.execute(
         "SELECT * FROM reconciliation_report WHERE id = ?",
@@ -849,7 +1331,7 @@ async def api_recon_report_detail(report_id: int):
         if d.get("order_no"):
             o = conn.execute(
                 "SELECT state, jky_trade_no, logistic_no, platform_state, last_error "
-                "FROM order_map WHERE platform_order_no = ?",
+                "FROM order_map WHERE platform_order_no = ? ORDER BY id DESC LIMIT 1",
                 (d["order_no"],),
             ).fetchone()
             if o:
