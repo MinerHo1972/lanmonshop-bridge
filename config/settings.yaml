@@ -23,7 +23,7 @@ jky:
 
 # Cron 调度
 cron:
-  a_interval_minutes: 5      # 中台 → 吉客云
+  a_interval_minutes: 60     # 中台 → 吉客云
   b_interval_minutes: 60     # 吉客云 → 中台（兜底）
   c_interval_minutes: 15     # 中台退 → 吉客云取消
   f_hour: 3                  # 三方对账

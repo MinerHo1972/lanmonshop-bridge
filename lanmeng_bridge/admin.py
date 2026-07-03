@@ -106,19 +106,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 
 <div id="panel-recon" class="panel">
-  <div class="stat-grid" id="recon-stats"></div>
-  <div class="action-bar">
-    <button id="recon-resubmit" onclick="resubmitSelected()" disabled>🔄 重新提交选中</button>
-    <span class="count" id="recon-count">已选 0 条</span>
-    <span style="flex:1"></span>
-    <button onclick="loadRecon()" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px">刷新</button>
+  <div class="sub-tab-bar" style="display:flex;gap:4px;margin-bottom:12px">
+    <div class="sub-tab active" onclick="switchReconSub('pending')">📋 待处理</div>
+    <div class="sub-tab" onclick="switchReconSub('report')">📊 日报</div>
   </div>
-  <div id="recon-result"></div>
-  <table><thead><tr>
-    <th style="width:30px"><input type="checkbox" id="recon-select-all" onchange="toggleAll()"></th>
-    <th>ID</th><th>平台单号</th><th>Bridge 状态</th><th>平台态</th><th>吉客云单号</th><th>物流单号</th><th>差异标记</th><th>错误/备注</th><th>更新于</th>
-  </tr></thead>
-  <tbody id="recon-rows"></tbody></table>
+
+  <div id="recon-sub-pending">
+    <div class="stat-grid" id="recon-stats"></div>
+    <div class="action-bar">
+      <button id="recon-resubmit" onclick="resubmitSelected()" disabled>🔄 重新提交选中</button>
+      <span class="count" id="recon-count">已选 0 条</span>
+      <span style="flex:1"></span>
+      <button onclick="loadRecon()" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px">刷新</button>
+    </div>
+    <div id="recon-result"></div>
+    <table><thead><tr>
+      <th style="width:30px"><input type="checkbox" id="recon-select-all" onchange="toggleAll()"></th>
+      <th>ID</th><th>平台单号</th><th>Bridge 状态</th><th>平台态</th><th>吉客云单号</th><th>物流单号</th><th>差异标记</th><th>错误/备注</th><th>更新于</th>
+    </tr></thead>
+    <tbody id="recon-rows"></tbody></table>
+  </div>
+
+  <div id="recon-sub-report" style="display:none">
+    <div class="stat-grid" id="report-stats"></div>
+    <h2>对账日报</h2>
+    <table><thead><tr><th>日期</th><th>蓝盟单数</th><th>DB 追踪</th><th>JKY 创单</th><th>已闭环</th><th>偏差数</th><th>待处理</th></tr></thead>
+    <tbody id="report-rows"></tbody></table>
+    <h2>差异详情</h2>
+    <table><thead><tr><th>平台单号</th><th>DB 状态</th><th>蓝盟态</th><th>JKY 状态</th><th>原因</th></tr></thead>
+    <tbody id="report-deviations"></tbody></table>
+  </div>
 </div>
 
 <div id="body-modal" class="modal" onclick="event.target===this&&closeModal()">
@@ -263,6 +280,64 @@ async function resubmitSelected(){
 }
 
 document.addEventListener('DOMContentLoaded',()=>{loadCrons();loadLogs(1)});
+
+// 对账子 tab
+function switchReconSub(name){
+  document.querySelectorAll('#panel-recon .sub-tab').forEach(e=>e.classList.remove('active'));
+  document.getElementById('recon-sub-pending').style.display='none';
+  document.getElementById('recon-sub-report').style.display='none';
+  if(name==='pending'){
+    document.querySelector('#panel-recon .sub-tab:nth-child(1)').classList.add('active');
+    document.getElementById('recon-sub-pending').style.display='block';
+    loadRecon();
+  }else{
+    document.querySelector('#panel-recon .sub-tab:nth-child(2)').classList.add('active');
+    document.getElementById('recon-sub-report').style.display='block';
+    loadReports();
+  }
+}
+
+async function loadReports(){
+  try{
+    // Try to load report detail (reports list first to find latest with deviations)
+    const list=await(await fetch('/admin/api/reconciliation/reports?limit=5')).json();
+    // stats from latest report
+    if(list.reports&&list.reports.length>0){
+      const latest=list.reports[0];
+      const s=latest.summary;
+      document.getElementById('report-stats').innerHTML=
+        '<div class="stat-card"><div class="num">'+s.lanmong_total+'</div><div class="label">蓝盟订单(30d)</div></div>'+
+        '<div class="stat-card"><div class="num">'+s.db_total+'</div><div class="label">DB 追踪</div></div>'+
+        '<div class="stat-card"><div class="num">'+s.jky_created+'</div><div class="label">JKY 创单</div></div>'+
+        '<div class="stat-card"><div class="num '+(s.deviations>0?'red':'')+'">'+s.deviations+'</div><div class="label">偏差</div></div>';
+      // report list rows
+      document.getElementById('report-rows').innerHTML=list.reports.map(r=>'<tr>'+
+        '<td>'+r.report_date+'</td>'+
+        '<td>'+r.summary.lanmong_total+'</td>'+
+        '<td>'+r.summary.db_total+'</td>'+
+        '<td>'+r.summary.jky_created+'</td>'+
+        '<td>'+r.summary.done+'</td>'+
+        '<td>'+(r.deviation_count>0?'<span class="badge badge-err">'+r.deviation_count+'</span>':'<span class="badge badge-ok">0</span>')+'</td>'+
+        '<td>'+r.summary.pending+'</td>'+
+      '</tr>').join('')||'<tr><td colspan="7" class="empty">暂无报告</td></tr>';
+      // load detail for deviations
+      const detail=await(await fetch('/admin/api/reconciliation/reports/'+latest.id)).json();
+      document.getElementById('report-deviations').innerHTML=(detail.deviations||[]).map(d=>'<tr>'+
+        '<td class="code">'+(d.order_no||'-')+'</td>'+
+        '<td>'+stateBadge(d.db_state||d.db_current_state||'-')+'</td>'+
+        '<td>'+(d.lanmong_state_label||'-')+'</td>'+
+        '<td>'+(d.jky_status||'-')+'</td>'+
+        '<td class="ttl" style="max-width:300px;overflow:hidden;text-overflow:ellipsis">'+(d.reason||'')+'</td>'+
+      '</tr>').join('')||'<tr><td colspan="5" class="empty">无差异</td></tr>';
+    }else{
+      document.getElementById('report-stats').innerHTML='<div class="stat-card"><div class="num">--</div><div class="label">暂无报告</div></div>';
+      document.getElementById('report-rows').innerHTML='<tr><td colspan="7" class="empty">暂无报告（cron-f 每天 03:30 生成）</td></tr>';
+      document.getElementById('report-deviations').innerHTML='<tr><td colspan="5" class="empty">暂无数据</td></tr>';
+    }
+  }catch(e){
+    document.getElementById('report-rows').innerHTML='<tr><td colspan="7" class="empty">加载失败: '+e.message+'</td></tr>';
+  }
+}
 </script>
 </body>
 </html>"""
@@ -724,3 +799,68 @@ async def _resubmit_create(row: dict, app_state) -> dict:
     transition(order_id, STATE_JKY_CREATED, "admin_resubmit")
     return {"success": True, "action": "create",
             "msg": f"创单成功: {new_trade_no}, 请在 JKY 后台手动审核"}
+
+
+# ---- 对账日报 ----
+
+@router.get("/api/reconciliation/reports")
+async def api_recon_reports(limit: int = Query(10, ge=1, le=90)):
+    """列出最近的对账日报"""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT id, report_date, run_id, summary_json, deviations_json,
+                  daily_trend_json, created_at
+           FROM reconciliation_report
+           ORDER BY id DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return {
+        "reports": [
+            {
+                "id": r["id"],
+                "report_date": r["report_date"],
+                "run_id": r["run_id"],
+                "summary": json.loads(r["summary_json"]),
+                "deviation_count": len(json.loads(r["deviations_json"] or "[]")),
+                "created_at": str(r["created_at"]) if r["created_at"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/api/reconciliation/reports/{report_id}")
+async def api_recon_report_detail(report_id: int):
+    """获取单份对账日报的完整详情"""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM reconciliation_report WHERE id = ?",
+        (report_id,),
+    ).fetchone()
+    if not row:
+        return {"error": "not_found"}
+
+    deviations = json.loads(row["deviations_json"] or "[]")
+    trend = json.loads(row["daily_trend_json"] or "[]")
+    summary = json.loads(row["summary_json"])
+
+    # 对偏差增加 DB 实时状态（如 jky_trade_no 可查最新 state）
+    for d in deviations:
+        if d.get("order_no"):
+            o = conn.execute(
+                "SELECT state, jky_trade_no, logistic_no, platform_state, last_error "
+                "FROM order_map WHERE platform_order_no = ?",
+                (d["order_no"],),
+            ).fetchone()
+            if o:
+                d["db_current_state"] = o["state"]
+
+    return {
+        "id": row["id"],
+        "report_date": row["report_date"],
+        "run_id": row["run_id"],
+        "summary": summary,
+        "deviations": deviations,
+        "trend": trend,
+        "created_at": str(row["created_at"]) if row["created_at"] else None,
+    }

@@ -170,6 +170,18 @@ CREATE TABLE IF NOT EXISTS order_merge (
 );
 CREATE INDEX IF NOT EXISTS idx_order_merge_source ON order_merge(source_trade_no);
 CREATE INDEX IF NOT EXISTS idx_order_merge_target ON order_merge(target_trade_no);
+
+-- 🆕 三方对账报告（cron-f 每日生成）
+CREATE TABLE IF NOT EXISTS reconciliation_report (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_date TEXT NOT NULL,           -- YYYY-MM-DD
+    run_id TEXT NOT NULL,                -- 唯一 run_id
+    summary_json TEXT NOT NULL,          -- 统计数据汇总
+    deviations_json TEXT,                -- JSON 差异列表
+    daily_trend_json TEXT,               -- 每日趋势
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_recon_report_date ON reconciliation_report(report_date);
 """
 
 
