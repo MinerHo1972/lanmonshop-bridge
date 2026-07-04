@@ -12,6 +12,7 @@ from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import RedirectResponse, HTMLResponse
 
 from .config import load_credentials
+from .storage.db import get_connection
 
 logger = logging.getLogger(__name__)
 
@@ -27,31 +28,32 @@ CALLBACK_URL = "https://bridge.minerho1972.ccwu.cc/admin/auth/callback"
 SESSION_TTL = timedelta(hours=24)
 SESSION_COOKIE = "admin_session"
 
-# ---------- Session Store ----------
-
-_sessions: dict[str, dict] = {}
-
 
 def _clean_expired():
-    """清理过期 session"""
-    now = datetime.now()
-    expired = [k for k, v in _sessions.items() if now > v["expires_at"]]
-    for k in expired:
-        del _sessions[k]
+    """清理过期 session（DB）"""
+    conn = get_connection()
+    conn.execute("DELETE FROM sessions WHERE expires_at < datetime('now')")
+    conn.commit()
 
 
 async def get_current_user(request: Request) -> Optional[dict]:
-    """从 Cookie 中获取当前登录用户信息"""
+    """从 Cookie 中获取当前登录用户信息（DB 持久化）"""
     session_id = request.cookies.get(SESSION_COOKIE)
     if not session_id:
         return None
-    session = _sessions.get(session_id)
-    if not session:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM sessions WHERE session_id = ? AND expires_at > datetime('now')",
+        (session_id,),
+    ).fetchone()
+    if not row:
         return None
-    if datetime.now() > session["expires_at"]:
-        del _sessions[session_id]
-        return None
-    return session["user"]
+    return {
+        "open_id": row["user_open_id"],
+        "union_id": row["user_union_id"],
+        "name": row["user_name"],
+        "avatar": row["user_avatar"],
+    }
 
 
 async def require_api_auth(request: Request):
@@ -129,7 +131,7 @@ async def feishu_login():
 
 @router.get("/callback")
 async def auth_callback(code: str, request: Request):
-    """飞书 OAuth 回调 — 兑换 token → 获取用户信息 → 创建 session"""
+    """飞书 OAuth 回调 — 兑换 token → 获取用户信息 → 创建 session（DB）"""
     # 1. 兑换 access_token
     token_url = "https://open.feishu.cn/open-apis/authen/v1/access_token"
     token_body = {
@@ -175,19 +177,23 @@ async def auth_callback(code: str, request: Request):
 
     user_info = user_data.get("data", {})
 
-    # 3. 创建 session
+    # 3. 创建 session（DB）
     _clean_expired()
     session_id = secrets.token_hex(32)
-    _sessions[session_id] = {
-        "user": {
-            "open_id": user_info.get("open_id", ""),
-            "union_id": user_info.get("union_id", ""),
-            "name": user_info.get("name", ""),
-            "avatar": user_info.get("avatar_url", ""),
-        },
-        "expires_at": datetime.now() + SESSION_TTL,
-        "created_at": datetime.now(),
-    }
+    expires_at = datetime.now() + SESSION_TTL
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO sessions (session_id, user_open_id, user_union_id, user_name, user_avatar, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            session_id,
+            user_info.get("open_id", ""),
+            user_info.get("union_id", ""),
+            user_info.get("name", ""),
+            user_info.get("avatar_url", ""),
+            expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    conn.commit()
 
     logger.info(f"[auth] 用户 {user_info.get('name')} 登录成功 (session={session_id[:8]}...)")
 
@@ -209,8 +215,10 @@ async def auth_callback(code: str, request: Request):
 async def logout(request: Request):
     """退出登录"""
     session_id = request.cookies.get(SESSION_COOKIE)
-    if session_id and session_id in _sessions:
-        del _sessions[session_id]
+    if session_id:
+        conn = get_connection()
+        conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        conn.commit()
         logger.info(f"[auth] 用户退出登录 (session={session_id[:8]}...)")
     resp = RedirectResponse(url="/admin/auth/login")
     resp.delete_cookie(key=SESSION_COOKIE, path="/admin")

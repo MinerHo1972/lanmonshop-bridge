@@ -131,7 +131,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div id="recon-result"></div>
     <table><thead><tr>
       <th style="width:30px"><input type="checkbox" id="recon-select-all" onchange="toggleAll()"></th>
-      <th>ID</th><th>平台单号</th><th>🟢 蓝盟</th><th>🔷 桥(DB)</th><th>🔴 吉客云</th><th>三端一致</th><th>吉客云单号</th><th>物流单号</th><th>错误/备注</th><th>更新于</th>
+      <th>ID</th><th>平台单号</th><th>🟢 蓝盟</th><th>🔷 桥(DB)</th><th>🔴 吉客云</th><th>三端一致</th><th>吉客云单号</th><th>物流单号</th><th>错误/备注</th><th>更新于</th><th style="width:60px">日志</th>
     </tr></thead>
     <tbody id="recon-rows"></tbody></table>
   </div>
@@ -165,6 +165,11 @@ function switchTab(name){
 }
 function showBody(t){document.getElementById('body-modal').classList.add('show');document.getElementById('modal-body').textContent=t}
 function closeModal(){document.getElementById('body-modal').classList.remove('show')}
+function switchToLogs(orderNo){
+  switchTab('logs');
+  document.getElementById('f-q').value=orderNo;
+  loadLogs(1);
+}
 function statusBadge(s){if(s>=200&&s<300)return'<span class="badge badge-ok">'+s+'</span>';if(s)return'<span class="badge badge-err">'+s+'</span>';return'-'}
 function apiCodeBadge(c){if(c===0||c===200)return'<span class="badge badge-ok">'+c+'</span>';if(c)return'<span class="badge badge-err">'+c+'</span>';return'-'}
 function stateBadge(s){
@@ -281,7 +286,8 @@ async function loadRecon(){
       '<td class="code">'+(o.logistic_no||'-')+'</td>'+
       '<td class="ttl" style="max-width:180px;overflow:hidden;text-overflow:ellipsis">'+(o.last_error||'')+'</td>'+
       '<td class="ttl">'+timeStr(o.updated_at)+'</td>'+
-    '</tr>').join('')||'<tr><td colspan="11" class="empty">无待处理订单</td></tr>';
+      '<td><button class="expand-btn" onclick="event.stopPropagation();switchToLogs(\'+o.platform_order_no+\')">📋</button></td>'+
+    '</tr>').join('')||'<tr><td colspan="12" class="empty">无待处理订单</td></tr>';
   }catch(e){document.getElementById('recon-rows').innerHTML='<tr><td colspan="10" class="empty">加载失败: '+e.message+'</td></tr>'}
 }
 
@@ -896,7 +902,7 @@ async def api_recon_pull_lanmong(request: Request):
                 continue
 
             new_state = orders_list[0].get("state", row["platform_state"])
-            from ..core.shared_unified import platform_to_unified
+            from .core.shared_unified import platform_to_unified
             new_unified = platform_to_unified(new_state)
             conn.execute(
                 "UPDATE order_map SET platform_state = ?, platform_unified = ?, updated_at = ? WHERE id = ?",

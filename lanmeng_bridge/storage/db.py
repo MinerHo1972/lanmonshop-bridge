@@ -207,6 +207,18 @@ CREATE TABLE IF NOT EXISTS express_sync_items (
   UNIQUE(express_sync_id, order_item_id)
 );
 
+-- 🆕 Admin session 持久化（重启不丢登录态）
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    user_open_id TEXT NOT NULL,
+    user_union_id TEXT DEFAULT '',
+    user_name TEXT DEFAULT '',
+    user_avatar TEXT DEFAULT '',
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
 -- 🆕 三方对账报告（cron-f 每日生成）
 CREATE TABLE IF NOT EXISTS reconciliation_report (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
