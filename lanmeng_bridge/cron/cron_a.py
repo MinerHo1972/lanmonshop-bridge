@@ -48,6 +48,9 @@ async def run_cron_a(
         except Exception as e:
             logger.error(f"[cron-a] 拉单失败 (page={page}): {e}")
             break
+        if resp.get("code") != 0:
+            logger.warning(f"[cron-a] 蓝盟查询异常 (page={page}): code={resp.get('code')} msg={resp.get('msg','')}")
+            break
         resp_data = resp.get("data", {})
         orders = (resp_data.get("orderList", [])
                   if isinstance(resp_data, dict)
@@ -144,9 +147,10 @@ async def run_cron_a(
         products = order.get("orderProducts", [])
         trade_order_details = []
         skip_order = False
+        order_total = 0.0
         for item in products:
             product_no = item.get("productNo", "")
-            qty = item.get("number", 1)
+            qty = item.get("num") or item.get("number") or 1
             if not product_no:
                 logger.warning(f"[cron-a] {order_no} 缺 productNo，跳过")
                 st_transition(map_id, STATE_SKIPPED, "cron_a", "缺 productNo")
@@ -161,12 +165,21 @@ async def run_cron_a(
                 st_transition(map_id, STATE_SKIPPED, "cron_a", f"{product_no} 无缓存")
                 skip_order = True
                 break
+            cost_price = float(item.get("costPrice", 0) or 0)
+            barcode = prod_row["jky_barcode"]
+            if not barcode:
+                logger.warning(f"[cron-a] {order_no} {product_no} 条码为空，跳过")
+                st_transition(map_id, STATE_SKIPPED, "cron_a", f"{product_no} 条码为空")
+                skip_order = True
+                break
+            sell_total = round(cost_price * qty, 2)
+            order_total += sell_total
             trade_order_details.append({
                 "goodsNo": product_no,
-                "barcode": prod_row["jky_barcode"] or "",
+                "barcode": barcode,
                 "goodsName": prod_row["jky_goods_name"] or "",
                 "specName": "默认", "unit": "件",
-                "sellPrice": 0, "sellCount": qty, "sellTotal": 0,
+                "sellPrice": cost_price, "sellCount": qty, "sellTotal": sell_total,
             })
 
         if skip_order:
@@ -179,7 +192,7 @@ async def run_cron_a(
                 "onlineTradeNo": order_no,
                 "shopName": "特渠分销对接", "shopCode": "0125", "warehouseCode": "02",
                 "tradeTime": now_str, "tradeType": 1,
-                "totalFee": 0, "payment": 0, "chargeCurrency": "人民币",
+                "totalFee": order_total, "payment": order_total, "chargeCurrency": "人民币",
                 "receiverName": order.get("name", ""),
                 "mobile": receiver_mobile, "phone": receiver_mobile,
                 "state": order.get("province", ""), "city": order.get("city", ""),
@@ -194,7 +207,7 @@ async def run_cron_a(
         try:
             create_resp = await jky.trade_create(create_biz)
             jky_code = create_resp.get("code", -1)
-            if jky_code not in (0, 200):
+            if jky_code != 200:
                 logger.error(f"[cron-a] {order_no} 创单失败: {create_resp}")
                 conn.execute(
                     "UPDATE order_map SET jky_state = NULL, jky_unified = NULL, bridge_unified = NULL WHERE id = ?",

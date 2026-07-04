@@ -57,7 +57,7 @@ async def run_cron_b(
         except Exception as e:
             logger.error(f"[cron-b] JKY 全量拉取失败: {e}")
             break
-        if resp.get("code") not in (0, 200):
+        if resp.get("code") != 200:
             logger.warning(f"[cron-b] JKY 查询异常: {resp}")
             break
         trades = resp.get("result", {}).get("data", {}).get("trades", [])
@@ -186,8 +186,14 @@ async def run_cron_b(
                 st_transition(map_id, STATE_JKY_SHIPPED, "cron_b")
 
             logistic_entry = logistic_resolver.resolve(logist_name)
-            express_code = logistic_entry.get("platform_code", "unknown")
-            express_name = logistic_entry.get("platform_name", logist_name)
+            platform_code = logistic_entry.get("platform_code", "")
+            platform_name = logistic_entry.get("platform_name", "")
+            if not platform_code or platform_code == "unknown":
+                logger.warning(f"[cron-b] {row['platform_order_no']} 无法解析物流公司 '{logist_name}'，跳过回传")
+                st_transition(map_id, STATE_FAILED, "cron_b", f"未知物流: {logist_name}")
+                continue
+            express_code = platform_code
+            express_name = platform_name or logist_name
 
             # 解析 items
             items = []
@@ -195,16 +201,25 @@ async def run_cron_b(
                 order_products = json.loads(row.get("order_items_json") or "[]")
                 for prod in order_products:
                     oiid = prod.get("orderItemId")
-                    num = prod.get("number", 1)
-                    if oiid:
-                        item = {"orderItemId": int(oiid), "num": int(num)}
-                        # 蓝盟 syncOrderExpress 要求 skuId 或 skuNo 至少传其一
-                        sku_no = prod.get("skuNo") or prod.get("skuId")
-                        if sku_no is not None:
-                            item["skuNo"] = str(sku_no) if isinstance(sku_no, int) else sku_no
-                        items.append(item)
+                    if not oiid:
+                        continue
+                    num = prod.get("num") or prod.get("number") or 1
+                    item = {"orderItemId": int(oiid), "num": int(num)}
+                    # 蓝盟 syncOrderExpress 要求 skuId 或 skuNo 至少传其一
+                    sku_no = prod.get("skuNo")
+                    sku_id = prod.get("skuId")
+                    if sku_no:
+                        item["skuNo"] = str(sku_no)
+                    elif sku_id:
+                        item["skuId"] = int(sku_id)
+                    items.append(item)
             except (json.JSONDecodeError, ValueError, TypeError):
                 pass
+
+            if not items:
+                logger.warning(f"[cron-b] {row['platform_order_no']} 无有效商品明细，跳过回传")
+                st_transition(map_id, STATE_FAILED, "cron_b", "无商品明细")
+                continue
 
             retry = RetryState()
             success = False
@@ -250,6 +265,7 @@ async def run_cron_b(
                             lanm_resp = await lanmong.get_deliver_orders(
                                 order_no=row["platform_order_no"],
                                 page_size=5,
+                                state=None,
                             )
                             lanm_data = lanm_resp.get("data", {})
                             order_list = (

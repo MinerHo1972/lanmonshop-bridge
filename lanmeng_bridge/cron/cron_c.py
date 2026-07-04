@@ -42,16 +42,19 @@ async def run_cron_c(
                 supplier_update_time_end=now_str,
                 page_size=200,
             )
-            resp_data = resp.get("data", {})
-            orders = (resp_data.get("orderList", [])
-                      if isinstance(resp_data, dict)
-                      else (resp_data if isinstance(resp_data, list) else []))
-            for o in orders:
-                no = o.get("orderNo", "")
-                st = o.get("state")
-                if no and st is not None:
-                    lanmong_cancelled[no] = st
-            logger.info(f"[cron-c] 蓝盟已取消 {len(lanmong_cancelled)} 条")
+            if resp.get("code") != 0:
+                logger.warning(f"[cron-c] 蓝盟查询异常: code={resp.get('code')} msg={resp.get('msg','')}")
+            else:
+                resp_data = resp.get("data", {})
+                orders = (resp_data.get("orderList", [])
+                          if isinstance(resp_data, dict)
+                          else (resp_data if isinstance(resp_data, list) else []))
+                for o in orders:
+                    no = o.get("orderNo", "")
+                    st = o.get("state")
+                    if no and st is not None:
+                        lanmong_cancelled[no] = st
+                logger.info(f"[cron-c] 蓝盟已取消 {len(lanmong_cancelled)} 条")
         except Exception as e:
             logger.warning(f"[cron-c] 拉蓝盟取消失败: {e}")
 
@@ -71,7 +74,7 @@ async def run_cron_c(
                 "shopIds": JKY_SHOP_IDS,
                 "fields": "tradeNo,onlineTradeNo,tradeStatus,tradeStatusExplain,mainPostid,scrollId",
             })
-            if resp.get("code") not in (0, 200):
+            if resp.get("code") != 200:
                 break
             trades = resp.get("result", {}).get("data", {}).get("trades", [])
             if not trades:
@@ -87,27 +90,32 @@ async def run_cron_c(
         successor_index = {}
         for t_data in all_jky.values():
             ts = str(t_data.get("tradeStatus", "") or "")
-            if ts == "5020":
+            if ts == "5020" or ts == "5030":
                 continue
             online_parts = [p.strip() for p in t_data.get("onlineTradeNo", "").split(",") if p.strip()]
             if len(online_parts) > 1:
                 for part in online_parts:
                     successor_index.setdefault(part, []).append(t_data)
 
-        # 从全量中筛选出确实取消的单（5010/5020/5030/4122, 排除被拆合单的 5020）
-        cancelled_ts_filter = {"5010", "5020", "5030", "4122"}
+        # 从全量中筛选出确实取消的单，同时检测拆合单后继
+        # 5010/4122 → 真正取消，直接计入
+        # 5020/5030 → 合并/拆分原单，检查是否有后继单还在推进
+        cancelled_ts_filter = {"5010", "4122"}
+        merge_split_ts = {"5020", "5030"}
         for key, t_data in all_jky.items():
             ts = str(t_data.get("tradeStatus", ""))
-            if ts not in cancelled_ts_filter:
-                continue
-            # 5020 需要检查是否是拆合单
-            if ts == "5020":
+            if ts in cancelled_ts_filter:
+                jky_cancelled_ts[key] = ts
+            elif ts in merge_split_ts:
+                # 检查是否有活跃后继单
                 platform_no = str(t_data.get("onlineTradeNo", "") or key)
                 resolved = resolve_jky_effective_state(t_data, platform_no, all_jky, successor_index)
-                if resolved["successor_trade_nos"]:
-                    logger.debug(f"[cron-c] {key} 是拆合单原单, 跳过取消检测")
+                if resolved.get("successor_trade_nos"):
+                    logger.debug(f"[cron-c] {key} 是{ts}原单, 后继单活跃, 跳过取消检测")
                     continue
-            jky_cancelled_ts[key] = ts
+                # 无后继单或后继单也已取消 → 视为真正取消
+                jky_cancelled_ts[key] = ts
+                logger.info(f"[cron-c] {key} 是{ts}原单且无活跃后继, 视为取消")
 
         logger.info(f"[cron-c] JKY 全量 {len(all_jky)} 条, 其中已取消 {len(jky_cancelled_ts)} 条")
     except Exception as e:
@@ -160,7 +168,7 @@ async def run_cron_c(
         logger.info(f"[cron-c] {order_no}({jky_trade_no}) 蓝盟已取消，调 JKY cancel")
         try:
             cancel_resp = await jky.trade_cancel({"tradeNos": jky_trade_no, "cancelReason": "420001"})
-            if cancel_resp.get("code") in (0, 200):
+            if cancel_resp.get("code") == 200:
                 new_jky_unified = "已取消/退款"
                 new_br_unified = new_jky_unified  # bridge 跟随 JKY
                 new_platform_unified = platform_to_unified(lm_state)

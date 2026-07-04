@@ -122,12 +122,17 @@ async def _pull_jky_trades(
                 "startModified": cutoff,
                 "endModified": now_str,
                 "shopIds": JKY_SHOP_IDS,
-                "fields": "tradeNo,onlineTradeNo,tradeStatus,tradeStatusExplain,mainPostid,logisticName,scrollId",
+                "fields": "tradeNo,onlineTradeNo,tradeStatus,tradeStatusExplain,"
+                          "mainPostid,logisticName,shopName,scrollId,"
+                          "receiverName,mobile,phone,state,city,district,address,"
+                          "payment,totalFee,"
+                          "goodsDetail.goodsNo,goodsDetail.goodsName,"
+                          "goodsDetail.sellCount,goodsDetail.sellPrice,goodsDetail.sellTotal",
             })
         except Exception as e:
             logger.warning(f"[cron-f] JKY 全量拉取失败: {e}")
             break
-        if resp.get("code") not in (0, 200):
+        if resp.get("code") != 200:
             break
         trades = resp.get("result", {}).get("data", {}).get("trades", [])
         if not trades:
@@ -141,6 +146,195 @@ async def _pull_jky_trades(
             break
     logger.info(f"[cron-f] JKY 全量返回 {len(result)} 条")
     return result
+
+
+def _compare_order_fields(lanmeng_order: dict, jky_trade: dict) -> list[dict]:
+    """Compare key fields between Blue Alliance and JKY order data.
+
+    Returns a list of field mismatch dicts: [{field, lanmeng_value, jky_value, detail}]
+    """
+    mismatches = []
+
+    # Helper: safe string conversion
+    def _safe_str(v):
+        if v is None:
+            return ""
+        if isinstance(v, (int, float)):
+            return str(v)
+        return str(v).strip()
+
+    # Helper: safe int conversion
+    def _safe_int(v):
+        if v is None:
+            return 0
+        try:
+            return int(float(str(v)))
+        except (ValueError, TypeError):
+            return 0
+
+    # 1. Receiver name
+    lm_name = _safe_str(lanmeng_order.get("name"))
+    jky_name = _safe_str(jky_trade.get("receiverName"))
+    if lm_name and jky_name and lm_name != jky_name:
+        mismatches.append({
+            "field": "receiver",
+            "lanmeng_value": lm_name,
+            "jky_value": jky_name,
+            "detail": "收货人不一致",
+        })
+
+    # 2. Phone / mobile
+    lm_mobile = _safe_str(lanmeng_order.get("mobile"))
+    jky_mobile = _safe_str(jky_trade.get("mobile") or jky_trade.get("phone"))
+    if lm_mobile and jky_mobile and lm_mobile != jky_mobile:
+        mismatches.append({
+            "field": "phone",
+            "lanmeng_value": lm_mobile,
+            "jky_value": jky_mobile,
+            "detail": "联系电话不一致",
+        })
+
+    # 3. Address (combine province+city+district+address)
+    lm_addr = " ".join(filter(None, [
+        _safe_str(lanmeng_order.get("province")),
+        _safe_str(lanmeng_order.get("city")),
+        _safe_str(lanmeng_order.get("district")),
+        _safe_str(lanmeng_order.get("address")),
+    ])).strip()
+    jky_addr = " ".join(filter(None, [
+        _safe_str(jky_trade.get("state")),
+        _safe_str(jky_trade.get("city")),
+        _safe_str(jky_trade.get("district")),
+        _safe_str(jky_trade.get("address")),
+    ])).strip()
+    if lm_addr and jky_addr and lm_addr != jky_addr:
+        mismatches.append({
+            "field": "address",
+            "lanmeng_value": lm_addr,
+            "jky_value": jky_addr,
+            "detail": "收件地址不一致",
+        })
+
+    # 4. Order total — 蓝盟 costPrice(供货价)=JKY sellPrice(销售价)
+    # 蓝盟 orderProducts[].costPrice（供货价，PDF P47）在 bridge 设计中
+    # 直接映射为 JKY tradeOrderDetails[].sellPrice。因此可以用
+    # sum(costPrice × num) 作为预期 JKY totalFee/payment 进行对比。
+    # 参见：docs/中台对外开放接口规范-蓝盟-20260622.pdf P46-47
+    jky_total = 0
+    try:
+        jky_total = float(jky_trade.get("totalFee") or jky_trade.get("payment") or 0)
+    except (ValueError, TypeError):
+        jky_total = 0
+
+    lm_products = lanmeng_order.get("orderProducts") or []
+    lm_goods_total = 0.0
+    for p in lm_products:
+        cost = float(p.get("costPrice") or 0)
+        qty = _safe_int(p.get("num") or p.get("number"))
+        lm_goods_total += round(cost * qty, 2)
+
+    if jky_total <= 0 and lm_goods_total > 0:
+        mismatches.append({
+            "field": "total_fee",
+            "lanmeng_value": f"供货价合计{lm_goods_total:.2f}（→JKY 销售价）",
+            "jky_value": f"{jky_total:.2f}",
+            "detail": f"JKY 订单金额为 0（蓝盟供货价合计={lm_goods_total:.2f}），创单时金额字段未正确传递",
+        })
+    elif abs(jky_total - lm_goods_total) > 0.01 and jky_total > 0 and lm_goods_total > 0:
+        mismatches.append({
+            "field": "total_fee",
+            "lanmeng_value": f"供货价合计{lm_goods_total:.2f}（→JKY 销售价）",
+            "jky_value": f"{jky_total:.2f}",
+            "detail": f"金额不一致（蓝盟供货价合计={lm_goods_total:.2f}, JKY={jky_total:.2f}）",
+        })
+
+    # 5. Product comparison — match by goodsNo/productNo (not by index)
+    jky_goods = jky_trade.get("goodsDetail") or []
+    if lm_products and jky_goods:
+        # Build indexes by productNo/goodsNo
+        lm_by_no = {}
+        for p in lm_products:
+            no = _safe_str(p.get("productNo"))
+            if no:
+                lm_by_no[no] = p
+        jky_by_no = {}
+        for g in jky_goods:
+            no = _safe_str(g.get("goodsNo"))
+            if no:
+                jky_by_no[no] = g
+
+        product_details = []
+
+        # Check count
+        lm_count = len(lm_products)
+        jky_count = len(jky_goods)
+        if lm_count != jky_count and not lm_by_no and not jky_by_no:
+            # Only flag count difference if no productNo to match (index compare unreliable)
+            mismatches.append({
+                "field": "product_count",
+                "lanmeng_value": str(lm_count),
+                "jky_value": str(jky_count),
+                "detail": f"商品数量不一致（蓝盟{lm_count}件, JKY{jky_count}件）",
+            })
+
+        # If we can match by productNo → detailed per-item comparison
+        if lm_by_no and jky_by_no:
+            all_nos = set(lm_by_no) | set(jky_by_no)
+            for no in sorted(all_nos):
+                p = lm_by_no.get(no)
+                g = jky_by_no.get(no)
+                if not g:
+                    product_details.append(
+                        f"货品「{_safe_str(p.get('productName'))}」({no}) 在 JKY 中不存在"
+                    )
+                    continue
+                if not p:
+                    product_details.append(
+                        f"货品「{_safe_str(g.get('goodsName'))}」({no}) 在蓝盟中不存在"
+                    )
+                    continue
+                # Compare name
+                p_name = _safe_str(p.get("productName"))
+                g_name = _safe_str(g.get("goodsName"))
+                if p_name and g_name and p_name != g_name:
+                    product_details.append(
+                        f"{no}: 蓝盟「{p_name}」vs JKY「{g_name}」"
+                    )
+                # Compare quantity
+                p_qty = _safe_int(p.get("num") or p.get("number"))
+                g_qty = _safe_int(g.get("sellCount"))
+                if p_qty != g_qty:
+                    product_details.append(
+                        f"{no}: 数量不一致（蓝盟{p_qty} vs JKY{g_qty}）"
+                    )
+        else:
+            # Fallback: index-based comparison with safe access
+            for i, lm_prod in enumerate(lm_products):
+                p_name = _safe_str(lm_prod.get("productName"))
+                p_qty = _safe_int(lm_prod.get("num") or lm_prod.get("number"))
+                if i < len(jky_goods):
+                    g_name = _safe_str(jky_goods[i].get("goodsName"))
+                    g_qty = _safe_int(jky_goods[i].get("sellCount"))
+                    if p_name and g_name and p_name != g_name:
+                        product_details.append(
+                            f"第{i+1}件: 蓝盟「{p_name}」vs JKY「{g_name}」"
+                        )
+                    if p_qty != g_qty:
+                        product_details.append(
+                            f"第{i+1}件数量: 蓝盟{p_qty} vs JKY{g_qty}"
+                        )
+                else:
+                    product_details.append(f"第{i+1}件「{p_name}」JKY 无对应明细")
+
+        if product_details:
+            mismatches.append({
+                "field": "product_detail",
+                "lanmeng_value": f"{lm_count}件",
+                "jky_value": f"{jky_count}件",
+                "detail": "; ".join(product_details[:8]),
+            })
+
+    return mismatches
 
 
 def _build_report(
@@ -267,6 +461,22 @@ def _build_report(
             })
             continue
 
+        # ---- 字段级一致性比对（仅当蓝盟+JKY 两端均有数据时）----
+        if jky_trade_no and jky_trade_no in jky_trades:
+            field_mismatches = _compare_order_fields(order, jky_trades[jky_trade_no])
+            if field_mismatches:
+                deviations.append({
+                    "order_no": order_no,
+                    "db_state": db_state,
+                    "lanmong_state": lanmong_state,
+                    "lanmong_state_label": lanmong_state_label,
+                    "jky_trade_no": jky_trade_no,
+                    "jky_status": jky_status,
+                    "reason": "字段级不一致",
+                    "field_mismatches": field_mismatches,
+                })
+                continue
+
     # ---- 补充：DB 有但蓝盟没返回的订单（可能是窗口外或无更新） ----
     db_order_nos = set(db_by_order_no.keys())
     lanmeng_order_nos = set(lanmong_orders.keys())
@@ -353,6 +563,13 @@ def _format_feishu_report(report: dict) -> str:
                          f"蓝盟={d['lanmong_state_label']} | "
                          f"JKY={d['jky_status'] or '-'}")
             lines.append(f"   原因: {d['reason']}")
+            # 字段级差异详情
+            fm = d.get("field_mismatches", [])
+            if fm:
+                for f in fm[:5]:
+                    lines.append(f"   ├ {f['detail']}")
+                if len(fm) > 5:
+                    lines.append(f"   └ ... 共 {len(fm)} 处字段不一致")
         if len(devs) > 10:
             lines.append(f"   ... 共 {len(devs)} 条, 详情见管理后台")
         lines.append("")

@@ -237,8 +237,8 @@ async function loadLogs(page){
       '<td>'+apiCodeBadge(l.api_code)+'</td>'+
       '<td>'+resultBadge(l.is_success)+'</td>'+
       '<td>'+durStr(l.duration_ms)+'</td>'+
-      '<td>'+(l.request_body?'<button class="expand-btn" onclick="showBody(this.dataset.body)" data-body="'+(l.request_body.slice(0,200).replace(/"/g,'&quot;'))+'">查看</button>':'-')+'</td>'+
-      '<td>'+(l.response_body?'<button class="expand-btn" onclick="showBody(this.dataset.body)" data-body="'+(l.response_body.slice(0,200).replace(/"/g,'&quot;'))+'">查看</button>':'-')+'</td>'+
+      '<td>'+(l.request_body?'<button class="expand-btn" onclick="showBody(this.dataset.body)" data-body="'+(l.request_body.slice(0,800).replace(/"/g,'&quot;'))+'">查看</button>':'-')+'</td>'+
+      '<td>'+(l.response_body?'<button class="expand-btn" onclick="showBody(this.dataset.body)" data-body="'+(l.response_body.slice(0,800).replace(/"/g,'&quot;'))+'">查看</button>':'-')+'</td>'+
       '<td class="ttl" style="max-width:120px;overflow:hidden;text-overflow:ellipsis">'+(l.error||'')+'</td>'+
       '<td class="ttl">'+timeStr(l.created_at)+'</td>'+
     '</tr>').join('')||'<tr><td colspan="11" class="empty">无匹配日志</td></tr>';
@@ -953,8 +953,11 @@ async def api_recon_pull_jky(request: Request):
             continue
 
         try:
-            resp = await jky.trade_list({"tradeNos": trade_no})
-            if resp.get("code") not in (0, 200):
+            resp = await jky.trade_list({
+                "tradeNos": trade_no,
+                "fields": "tradeNo,onlineTradeNo,tradeStatus,tradeStatusExplain,mainPostid,logisticName",
+            })
+            if resp.get("code") != 200:
                 results.append({"id": order_id, "success": False, "action": "pull-jky",
                                 "msg": f"JKY 查询失败: {resp.get('msg', '')}"})
                 continue
@@ -1019,12 +1022,29 @@ async def api_recon_resubmit_lanmong(request: Request):
             if row["order_items_json"]:
                 try:
                     products = json.loads(row["order_items_json"])
-                    order_items = [
-                        {"orderItemId": p.get("orderItemId", 0), "num": p.get("number", 1)}
-                        for p in products if p.get("orderItemId")
-                    ]
+                    order_items = []
+                    for p in products:
+                        oiid = p.get("orderItemId")
+                        if not oiid:
+                            continue
+                        item = {
+                            "orderItemId": int(oiid),
+                            "num": int(p.get("num") or p.get("number") or 1),
+                        }
+                        sku_no = p.get("skuNo")
+                        sku_id = p.get("skuId")
+                        if sku_no:
+                            item["skuNo"] = str(sku_no)
+                        elif sku_id:
+                            item["skuId"] = int(sku_id)
+                        order_items.append(item)
                 except Exception:
                     pass
+
+            if not order_items:
+                results.append({"id": order_id, "success": False, "action": "resubmit-lanmong",
+                                "msg": "无商品明细（order_items_json 为空或无有效 orderItemId）"})
+                continue
 
             resp = await lanmong.sync_order_express(
                 order_id=row["platform_order_id"] or 0,
@@ -1034,7 +1054,7 @@ async def api_recon_resubmit_lanmong(request: Request):
                 express_name="申通快递",
                 warehouse_id=2,
                 warehouse_name="一号仓",
-                items=order_items or [{"orderItemId": 0, "num": 1}],
+                items=order_items,
             )
 
             if resp.get("code") == 0:
@@ -1116,7 +1136,7 @@ async def _resubmit_one(row: dict, app_state) -> dict:
                 jky_direct = app_state.jky_direct
                 if jky_direct:
                     resp = await jky_direct.trade_cancel(jky_trade_no, "420001")
-                    if resp.get("code") != 0:
+                    if resp.get("code") != 200:
                         return {"success": False, "action": "cancel",
                                 "msg": f"JKY 取消失败: {resp.get('msg','')}"}
                     transition(order_id, STATE_JKY_CANCELLED, "admin_resubmit")
@@ -1204,24 +1224,32 @@ async def _resubmit_create(row: dict, app_state) -> dict:
     conn = get_connection()
     products = order.get("orderProducts", [])
     trade_order_details = []
+    order_total = 0.0
     for item in products:
         product_no = item.get("productNo", "")
-        qty = item.get("number", 1)
+        qty = item.get("num") or item.get("number") or 1
         if not product_no:
             continue
         prod_row = conn.execute(
             "SELECT jky_barcode, jky_goods_name FROM jky_product_cache WHERE jky_goods_no = ?",
             (product_no,),
         ).fetchone()
+        if not prod_row or not prod_row["jky_barcode"]:
+            logger.warning(f"[resubmit] {platform_order_no} {product_no} 无缓存或条码为空，跳过")
+            return {"success": False, "action": "create",
+                    "msg": f"货品 {product_no} 无缓存或条码为空，无法创单"}
+        cost_price = float(item.get("costPrice", 0) or 0)
+        sell_total = round(cost_price * qty, 2)
+        order_total = (order_total or 0) + sell_total
         trade_order_details.append({
             "goodsNo": product_no,
-            "barcode": prod_row["jky_barcode"] if prod_row else "",
-            "goodsName": prod_row["jky_goods_name"] if prod_row else "",
+            "barcode": prod_row["jky_barcode"],
+            "goodsName": prod_row["jky_goods_name"] or "",
             "specName": "默认",
             "unit": "件",
-            "sellPrice": 0,
+            "sellPrice": cost_price,
             "sellCount": qty,
-            "sellTotal": 0,
+            "sellTotal": sell_total,
         })
 
     if not trade_order_details:
@@ -1237,8 +1265,8 @@ async def _resubmit_create(row: dict, app_state) -> dict:
             "warehouseCode": "02",
             "tradeTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "tradeType": 1,
-            "totalFee": 0,
-            "payment": 0,
+            "totalFee": order_total or 0,
+            "payment": order_total or 0,
             "chargeCurrency": "人民币",
             "receiverName": order.get("name", ""),
             "mobile": receiver_mobile,
@@ -1262,10 +1290,13 @@ async def _resubmit_create(row: dict, app_state) -> dict:
     try:
         create_resp = await jky_direct.trade_create(create_biz["tradeOrder"])
         jky_code = create_resp.get("code", -1)
-        if jky_code != 0:
+        if jky_code != 200:
             return {"success": False, "action": "create",
-                    "msg": f"JKY 创单失败: {create_resp.get('msg','')}"}
-        new_trade_no = create_resp.get("data", {}).get("tradeNo", "")
+                    "msg": f"JKY 创单失败: {create_resp.get('msg','')} (code={jky_code})"}
+        new_trade_no = (create_resp.get("result", {})
+                       .get("data", {})
+                       .get("tradeOrder", {})
+                       .get("tradeNo", ""))
         if not new_trade_no:
             return {"success": False, "action": "create",
                     "msg": f"JKY 创单返回但缺 tradeNo: {json.dumps(create_resp, ensure_ascii=False)}"}
