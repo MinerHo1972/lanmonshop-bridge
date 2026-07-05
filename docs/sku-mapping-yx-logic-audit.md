@@ -17,6 +17,31 @@
 
 ## 受影响的代码位置
 
+### 0. 🆕 公共告警缺口：SKU 映射失败必须 P1 告警（影响所有 cron）
+
+**当前状态**：`STATE_SKIPPED` 后没有任何飞书告警，运营无法及时发现映射缺失。
+
+**需要改**：在 YX 转换 `if not resolved` 分支中，调用 `notifier.alert_p1(...)`，让运营立即知道映射缺失。
+
+```python
+if product_no.startswith("YX"):
+    resolved = sku_resolver.resolve(product_no)
+    if not resolved:
+        st_transition(map_id, STATE_SKIPPED, "cron_a", f"{product_no} 无sku映射")
+        await notifier.alert_p1(
+            platform_order_no,
+            f"SKU 映射缺失: {product_no}（应补 sku_mapping 表）",
+            retry_count=0,
+            order_map_id=map_id,
+        )
+        skip_order = True
+        break
+```
+
+**通知内容**：包含 `platform_order_no` + `productNo` + 操作提示"请在 DB 中补入 `sku_mapping` 记录"
+
+---
+
 ### 1. `cron/cron_a.py` L152-L178 — 推单时 SKU 编码转换 ⚠️ 优先级最高
 
 **现代码路径**：
@@ -177,6 +202,59 @@ VALUES
 | P1 | `admin.py` SKU 转换 | 后台重新提交同路径 | ~10 行 |
 | P2 | `cron_f.py` 索引构建 | 对账时 YX 编码商品匹配不到 JKY 侧，导致假报警 | ~5 行 |
 | P3 | `cron_b.py` 部分发货过滤 | 目前 ECS 未实现部分发货过滤功能（独立假设计） | 待后续 |
+| P1 | **Admin 后台改造** — 改名订单表 + 筛选未递交 | 运营需要入口找回 SKIP/FAIL 订单重新递交 | ~20 行后端 ~30 行前端 |
+
+---
+
+## 🆕 6. Admin 后台改造：订单表 + 未递交筛选 + 重新递交
+
+### 背景
+
+当前 Admin 页面只有"对账"（reconciliation）TAB，用户无法一眼看到哪些订单因为 SKU 映射缺失等原因被跳过（skipped）或创单失败（failed）。补好 `sku_mapping` 表后，需要能直接筛选出来重新递交。
+
+### 改动内容
+
+#### 6.1 对账 TAB 改为"订单表"
+
+- TAB 标签从 `🔄 对账` 改为 `📋 订单表`
+- 页面标题/描述同步更新
+- DIV id/JS 变量名保持兼容（id="panel-recon" 不变以避免破坏已有逻辑）
+
+#### 6.2 增加「未递交」筛选按钮
+
+在现有筛选条件行中增加：
+
+```html
+<button class="btn-filter" data-state="undelivered">未递交</button>
+```
+
+JS 层面，`data-state="undelivered"` 触发条件：
+
+```javascript
+// bridge_state in ['init', 'failed', 'skipped'] AND jky_trade_no IS NULL
+// 等价 SQL: WHERE state IN ('init','failed','skipped') AND jky_trade_no IS NULL
+```
+
+后端 API 不变，前端用筛选条件过滤即可。
+
+#### 6.3 重新递交走完整映射查表流程
+
+Admin 的 `重新提交` 按钮（POST /admin/recon/{id}/resubmit）**当前已存在**，它调用 `admin.py` 的 `_resubmit_create_order` 函数，会：
+1. 重新从蓝盟拉取该订单原始数据
+2. 解析 products → 构建 tradeOrderDetails
+3. **走 YX 前缀判断 + sku_mapping 查表 + jky_product_cache 查条码** ← 加入 YX 映射后自动受益
+4. 调 JKY trade_create
+
+所以**不需要新增 API 路由**，只需：
+- 前端筛选出 `state=skipped/failed` 的订单
+- 点击"重新提交"即可触发完整映射查表流程
+
+#### 6.4 批量重提的考虑
+
+一期不做批量重提（选定多个订单一键重提）。理由：
+- 刚上线时 SKIP/FAIL 订单量不会很大（2 个 YX 商品）
+- 单个重提已有完整逻辑
+- 后续有需要可以加 multi-select + batch POST
 
 ---
 
