@@ -1225,9 +1225,6 @@ async def _resubmit_create(row: dict, app_state) -> dict:
     lanmong = app_state.lanmong_client
 
     if not jky_direct or not lanmong:
-        await app_state.notifier._send(
-            f"[P2] _resubmit_create 失败: order_no={platform_order_no}, 原因: 客户端不可用"
-        )
         return {"success": False, "action": "create", "msg": "客户端不可用"}
 
     if jky_trade_no:
@@ -1245,19 +1242,13 @@ async def _resubmit_create(row: dict, app_state) -> dict:
             orders_list = lanmong_data if isinstance(lanmong_data, list) else []
 
         if not orders_list:
-            msg = "蓝盟未返回该订单数据（可能已过期或不存在）"
-            await app_state.notifier._send(
-                f"[P2] _resubmit_create 失败: order_no={platform_order_no}, 原因: {msg}"
-            )
-            return {"success": False, "action": "create", "msg": msg}
+            return {"success": False, "action": "create",
+                    "msg": "蓝盟未返回该订单数据（可能已过期或不存在）"}
 
         order = orders_list[0]
     except Exception as e:
-        msg = f"蓝盟拉单失败: {e}"
-        await app_state.notifier._send(
-            f"[P2] _resubmit_create 失败: order_no={platform_order_no}, 原因: {msg}"
-        )
-        return {"success": False, "action": "create", "msg": msg}
+        return {"success": False, "action": "create",
+                "msg": f"蓝盟拉单失败: {e}"}
 
     # Step 2: Auto-review on lanmong
     try:
@@ -1289,9 +1280,6 @@ async def _resubmit_create(row: dict, app_state) -> dict:
             if not resolved:
                 msg = f"{product_no} 无sku映射（应补 sku_mapping 表）"
                 logger.warning(f"[resubmit] {platform_order_no} {msg}")
-                await app_state.notifier._send(
-                    f"[P2] _resubmit_create 失败: order_no={platform_order_no}, 原因: {msg}"
-                )
                 return {"success": False, "action": "create", "msg": msg}
             jky_goods_no = resolved
             logger.info(f"[resubmit] {platform_order_no} YX映射: {product_no} → {jky_goods_no}")
@@ -1302,11 +1290,8 @@ async def _resubmit_create(row: dict, app_state) -> dict:
         ).fetchone()
         if not prod_row or not prod_row["jky_barcode"]:
             logger.warning(f"[resubmit] {platform_order_no} {jky_goods_no} 无缓存或条码为空，跳过")
-            msg = f"货品 {jky_goods_no} 无缓存或条码为空，无法创单"
-            await app_state.notifier._send(
-                f"[P2] _resubmit_create 失败: order_no={platform_order_no}, 原因: {msg}"
-            )
-            return {"success": False, "action": "create", "msg": msg}
+            return {"success": False, "action": "create",
+                    "msg": f"货品 {jky_goods_no} 无缓存或条码为空，无法创单"}
         cost_price = float(item.get("costPrice", 0) or 0)
         sell_total = round(cost_price * qty, 2)
         order_total = (order_total or 0) + sell_total
@@ -1322,11 +1307,7 @@ async def _resubmit_create(row: dict, app_state) -> dict:
         })
 
     if not trade_order_details:
-        msg = "无有效商品明细"
-        await app_state.notifier._send(
-            f"[P2] _resubmit_create 失败: order_no={platform_order_no}, 原因: {msg}"
-        )
-        return {"success": False, "action": "create", "msg": msg}
+        return {"success": False, "action": "create", "msg": "无有效商品明细"}
 
     # Step 4: Create JKY trade via direct client
     receiver_mobile = order.get("mobile", "")
@@ -1364,21 +1345,15 @@ async def _resubmit_create(row: dict, app_state) -> dict:
         create_resp = await jky_direct.trade_create(create_biz["tradeOrder"])
         jky_code = create_resp.get("code", -1)
         if jky_code != 200:
-            msg = f"JKY 创单失败: {create_resp.get('msg','')} (code={jky_code})"
-            await app_state.notifier._send(
-                f"[P2] _resubmit_create 失败: order_no={platform_order_no}, 原因: {msg}"
-            )
-            return {"success": False, "action": "create", "msg": msg}
+            return {"success": False, "action": "create",
+                    "msg": f"JKY 创单失败: {create_resp.get('msg','')} (code={jky_code})"}
         new_trade_no = (create_resp.get("result", {})
                        .get("data", {})
                        .get("tradeOrder", {})
                        .get("tradeNo", ""))
         if not new_trade_no:
-            msg = f"JKY 创单返回但缺 tradeNo: {json.dumps(create_resp, ensure_ascii=False)}"
-            await app_state.notifier._send(
-                f"[P2] _resubmit_create 失败: order_no={platform_order_no}, 原因: {msg}"
-            )
-            return {"success": False, "action": "create", "msg": msg}
+            return {"success": False, "action": "create",
+                    "msg": f"JKY 创单返回但缺 tradeNo: {json.dumps(create_resp, ensure_ascii=False)}"}
         conn.execute(
             "UPDATE order_map SET jky_trade_no = ?, order_items_json = ? WHERE id = ?",
             (new_trade_no, json.dumps(products, ensure_ascii=False, default=str), order_id),
@@ -1386,11 +1361,7 @@ async def _resubmit_create(row: dict, app_state) -> dict:
         conn.commit()
     except Exception as e:
         transition(order_id, STATE_FAILED, "admin_resubmit", str(e))
-        msg = f"JKY 创单异常: {e}"
-        await app_state.notifier._send(
-            f"[P2] _resubmit_create 失败: order_no={platform_order_no}, 原因: {msg}"
-        )
-        return {"success": False, "action": "create", "msg": msg}
+        return {"success": False, "action": "create", "msg": f"JKY 创单异常: {e}"}
 
     transition(order_id, STATE_JKY_CREATED, "admin_resubmit")
     return {"success": True, "action": "create",
