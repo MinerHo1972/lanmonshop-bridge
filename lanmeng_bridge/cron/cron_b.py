@@ -43,7 +43,6 @@ async def run_cron_b(
 
     # ---- Step 1: 拉 JKY 全量（多窗口分段拉取，每段 ≤7 天）----
     all_jky = {}  # {tradeNo or onlineTradeNo: trade_data}
-    total_fetched = 0
     try:
         # pull_jky_trades_multi_window 内部按 7 天窗口分段，自动合并去重
         all_jky = await pull_jky_trades_multi_window(jky, JKY_LOOKBACK_DAYS)
