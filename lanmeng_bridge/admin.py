@@ -127,7 +127,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <button id="recon-resubmit" onclick="doAction()" disabled>执行</button>
       <span class="count" id="recon-count">已选 0 条</span>
       <span style="flex:1"></span>
-      <button onclick="loadRecon()" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px">刷新</button>
+      <button onclick="loadRecon(1)" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px">刷新</button>
     </div>
     <div id="recon-result"></div>
     <table><thead><tr>
@@ -135,6 +135,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <th>ID</th><th>平台单号</th><th>🟢 蓝盟</th><th>🔷 桥(DB)</th><th>🔴 吉客云</th><th>三端一致</th><th>吉客云单号</th><th>物流单号</th><th>错误/备注</th><th>更新于</th><th style="width:60px">日志</th>
     </tr></thead>
     <tbody id="recon-rows"></tbody></table>
+    <div class="pagination" id="recon-pagination" style="margin-top:8px">
+      <span id="recon-page-info" class="ttl"></span>
+      <div>
+        <button id="recon-prev" onclick="loadRecon(reconPage-1)" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px">← 上一页</button>
+        <span id="recon-page-num" style="margin:0 10px;color:#8b949e;font-size:12px"></span>
+        <button id="recon-next" onclick="loadRecon(reconPage+1)" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px">下一页 →</button>
+      </div>
+    </div>
   </div>
 
   <div id="recon-sub-report" style="display:none">
@@ -250,9 +258,13 @@ async function loadLogs(page){
   }catch(e){document.getElementById('log-rows').innerHTML='<tr><td colspan="9" class="empty">加载失败: '+e.message+'</td></tr>'}
 }
 
-async function loadRecon(){
+let reconPage=1;
+let reconTotalPages=1;
+
+async function loadRecon(page){
+  reconPage=page||1;
   try{
-    const r=await(await fetch('/admin/api/reconciliation')).json();
+    const r=await(await fetch('/admin/api/reconciliation?page='+reconPage+'&page_size=50')).json();
     const filter=document.getElementById('recon-filter').value;
     let orders=r.orders;
     if(filter==='consistent')orders=orders.filter(o=>o.consistent);
@@ -272,12 +284,12 @@ async function loadRecon(){
       else{counts[s].inconsistent++;inconsistentCount++}
     });
     document.getElementById('recon-stats').innerHTML=
-      '<div class="stat-card"><div class="num">'+total+'</div><div class="label">订单总数</div></div>'+
+      '<div class="stat-card"><div class="num">'+r.total+'</div><div class="label">订单总数</div></div>'+
       FIVE_STATES.map(s=>'<div class="stat-card"><div class="num '+(counts[s]?.inconsistent>0?'red':'')+'">'+(counts[s]?.total||0)+
         '</div><div class="label">'+s+'</div></div>').join('')+
       '<div class="stat-card"><div class="num">'+consistentCount+'</div><div class="label">一致</div></div>'+
       '<div class="stat-card"><div class="num '+(inconsistentCount>0?'red':'')+'">'+inconsistentCount+'</div><div class="label">不一致</div></div>'+
-      '<div class="stat-card"><div class="num">'+orders.length+'</div><div class="label">当前筛选</div></div>';
+      '<div class="stat-card"><div class="num">'+orders.length+'</div><div class="label">本页</div></div>';
     // rows — 用筛选后的 orders
     document.getElementById('recon-rows').innerHTML=orders.map((o,i)=>'<tr id="recon-tr-'+o.id+'" onclick="toggleRow('+o.id+')">'+
       '<td><input type="checkbox" class="recon-cb" data-id="'+o.id+'" onchange="toggleRow('+o.id+')" '+(selectedIds.has(o.id)?'checked':'')+'></td>'+
@@ -293,8 +305,16 @@ async function loadRecon(){
       '<td class="code">'+(o.logistic_no||'-')+'</td>'+
       '<td class="ttl" style="max-width:180px;overflow:hidden;text-overflow:ellipsis">'+(o.last_error||'')+'</td>'+
       '<td class="ttl">'+timeStr(o.updated_at)+'</td>'+
-      '<td><button class="expand-btn" onclick="event.stopPropagation();switchToLogs(\'+o.platform_order_no+\')">📋</button></td>'+
+      '<td><button class="expand-btn" onclick="event.stopPropagation();switchToLogs(\''+o.platform_order_no+'\')">📋</button></td>'+
     '</tr>').join('')||'<tr><td colspan="12" class="empty">无待处理订单</td></tr>';
+    // 分页控件
+    reconTotalPages=r.total_pages||1;
+    document.getElementById('recon-page-info').textContent='共 '+r.total+' 条 / 第 '+r.page+'/'+r.total_pages+' 页';
+    document.getElementById('recon-page-num').textContent=r.page+'/'+r.total_pages;
+    document.getElementById('recon-prev').disabled=r.page<=1;
+    document.getElementById('recon-next').disabled=r.page>=r.total_pages;
+    document.getElementById('recon-prev').style.opacity=r.page<=1?'.4':'1';
+    document.getElementById('recon-next').style.opacity=r.page>=r.total_pages?'.4':'1';
   }catch(e){document.getElementById('recon-rows').innerHTML='<tr><td colspan="10" class="empty">加载失败: '+e.message+'</td></tr>'}
 }
 
@@ -374,8 +394,8 @@ function updateCount(){
   updateActionSelect();
 }
 
-document.addEventListener('DOMContentLoaded',()=>{loadRecon();loadCrons();loadLogs(1)});
-document.getElementById('recon-filter')?.addEventListener('change',loadRecon);
+document.addEventListener('DOMContentLoaded',()=>{loadRecon(1);loadCrons();loadLogs(1)});
+document.getElementById('recon-filter')?.addEventListener('change',()=>loadRecon(1));
 
 // 对账子 tab
 function switchReconSub(name){
@@ -385,7 +405,7 @@ function switchReconSub(name){
   if(name==='pending'){
     document.querySelector('#panel-recon .sub-tab:nth-child(1)').classList.add('active');
     document.getElementById('recon-sub-pending').style.display='block';
-    loadRecon();
+    loadRecon(1);
   }else{
     document.querySelector('#panel-recon .sub-tab:nth-child(2)').classList.add('active');
     document.getElementById('recon-sub-report').style.display='block';
@@ -658,7 +678,7 @@ async def api_debug(request: Request):
 
 
 @router.get("/api/reconciliation")
-async def api_reconciliation(request: Request):
+async def api_reconciliation(request: Request, page: int = 1, page_size: int = 50):
     """三态对账：列出不一致/待处理的订单
 
     前置刷新：拉蓝盟近期已取消订单，更新 platform_state
@@ -667,6 +687,10 @@ async def api_reconciliation(request: Request):
     user = await get_current_user(request)
     if not user:
         raise HTTPException(status_code=401)
+    page = max(1, page)
+    page_size = min(200, max(10, page_size))
+    offset = (page - 1) * page_size
+
     conn = get_connection()
     cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -710,7 +734,13 @@ async def api_reconciliation(request: Request):
         except Exception as e:
             logger.warning(f"[recon] 蓝盟刷新失败（非致命）: {e}")
 
-    # ---- 查询 DB ----
+    # ---- 查询 DB：先算总数，再做分页查询 ----
+    total_row = conn.execute(
+        "SELECT COUNT(*) AS n FROM order_map WHERE updated_at >= ?",
+        (cutoff,),
+    ).fetchone()
+    total = total_row["n"]
+
     rows = conn.execute(
         """SELECT id, platform_order_no, platform_state, jky_trade_no,
                   logistic_no, state, retry_count, last_error, updated_at,
@@ -719,14 +749,14 @@ async def api_reconciliation(request: Request):
            WHERE updated_at >= ?
            ORDER BY
              CASE
-               WHEN state IN ('init','failed') THEN 0
+               WHEN state IN ('skipped','init','failed') THEN 0
                WHEN platform_state < 0 AND state NOT IN ('jky_cancelled','cancelled') THEN 1
                WHEN state IN ('jky_created','audited') THEN 2
                ELSE 3
              END,
              updated_at DESC
-           LIMIT 200""",
-        (cutoff,),
+           LIMIT ? OFFSET ?""",
+        (cutoff, page_size, offset),
     ).fetchall()
 
     orders = []
@@ -770,7 +800,10 @@ async def api_reconciliation(request: Request):
                 summary["inconsistent"] += 1
 
     return {
-        "total": len(rows),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, -(-total // page_size)),
         "orders": orders,
         "summary": summary,
     }
