@@ -50,9 +50,20 @@ async def run_cron_a(
             )
         except Exception as e:
             logger.error(f"[cron-a] 拉单失败 (page={page}): {e}")
+            if page == 1:
+                await notifier.alert_p1(
+                    "cron-a", f"蓝盟拉单失败 (page={page}): {e}",
+                    retry_count=0, order_map_id=0,
+                )
             break
         if resp.get("code") != 0:
-            logger.warning(f"[cron-a] 蓝盟查询异常 (page={page}): code={resp.get('code')} msg={resp.get('msg','')}")
+            msg = f"蓝盟查询异常 (page={page}): code={resp.get('code')} msg={resp.get('msg','')}"
+            logger.warning(f"[cron-a] {msg}")
+            if page == 1:
+                await notifier.alert_p1(
+                    "cron-a", msg,
+                    retry_count=0, order_map_id=0,
+                )
             break
         resp_data = resp.get("data", {})
         orders = (resp_data.get("orderList", [])
@@ -229,13 +240,18 @@ async def run_cron_a(
             create_resp = await jky.trade_create(create_biz)
             jky_code = create_resp.get("code", -1)
             if jky_code != 200:
+                err_msg = create_resp.get("msg", "创单失败")
                 logger.error(f"[cron-a] {order_no} 创单失败: {create_resp}")
                 conn.execute(
                     "UPDATE order_map SET jky_state = NULL, jky_unified = NULL, bridge_unified = NULL WHERE id = ?",
                     (map_id,),
                 )
                 conn.commit()
-                st_transition(map_id, STATE_FAILED, "cron_a", create_resp.get("msg", "创单失败"))
+                st_transition(map_id, STATE_FAILED, "cron_a", err_msg)
+                await notifier.alert_p1(
+                    order_no, f"JKY 创单失败: {err_msg}",
+                    retry_count=0, order_map_id=map_id,
+                )
                 continue
 
             jky_trade_no = (create_resp.get("result", {})
@@ -266,6 +282,10 @@ async def run_cron_a(
             )
             conn.commit()
             st_transition(map_id, STATE_FAILED, "cron_a", str(e))
+            await notifier.alert_p1(
+                order_no, f"JKY 创单异常: {e}",
+                retry_count=0, order_map_id=map_id,
+            )
             continue
 
     logger.info("[cron-a] 完成")

@@ -98,6 +98,10 @@ async def run_cron_c(
         logger.info(f"[cron-c] JKY 全量 {len(all_jky)} 条, 其中已取消 {len(jky_cancelled_ts)} 条")
     except Exception as e:
         logger.warning(f"[cron-c] 拉 JKY 全量失败: {e}")
+        await notifier.alert_p1("N/A", f"JKY 全量拉取失败: {e}", 0, 0)
+
+    if not all_jky:
+        await notifier.alert_p1("N/A", "JKY 全量拉取无数据返回", 0, 0)
 
     # ---- Step 3: 查 DB 匹配订单 ----
     db_rows = conn.execute(

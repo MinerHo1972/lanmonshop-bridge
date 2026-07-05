@@ -666,11 +666,15 @@ async def run_cron_f(
             retry.record_attempt(str(e))
             logger.error(f"[cron-f] JKY 全量拉取失败 (attempt={retry.attempt}): {e}")
             if retry.is_exhausted:
+                await notifier.alert_p1("N/A", f"JKY 全量拉取失败 (重试耗尽): {e}", 2, 0)
                 await notifier._send(
                     f"[cron-f] 警告: JKY 全量拉取失败 (重试耗尽): {e}\n"
                     "JKY 侧状态不可用于对账"
                 )
                 break
+
+    if not jky_trades:
+        await notifier.alert_p1("N/A", "JKY 全量拉取无数据返回", 0, 0)
 
     # ---- 3b. 兜底刷新 DB 统一态字段 ----
     from ..core.shared_unified import platform_to_unified, resolve_jky_effective_state, \
