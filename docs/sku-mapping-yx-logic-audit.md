@@ -239,15 +239,38 @@ JS 层面，`data-state="undelivered"` 触发条件：
 
 #### 6.3 重新递交走完整映射查表流程
 
-Admin 的 `重新提交` 按钮（POST /admin/recon/{id}/resubmit）**当前已存在**，它调用 `admin.py` 的 `_resubmit_create_order` 函数，会：
-1. 重新从蓝盟拉取该订单原始数据
-2. 解析 products → 构建 tradeOrderDetails
+Admin 的 `重新提交` 按钮（POST /admin/recon/{id}/resubmit）**当前已存在**，但 `_resubmit_one` 函数（admin.py L1129）有一个**终端态检查**会拦截 `skipped`：
+
+```python
+# Terminal states → skip（admin.py L1129）
+if state in ("done", "skipped", "jky_cancelled", "cancelled"):
+    return {"success": False, "action": "skipped_terminal", "msg": "终态无需处理"}
+```
+
+这意味着：即使是 YX 映射缺失导致的 `skipped`，当前后台也会直接拒绝重新提交。
+
+**需要同时修改三处后端逻辑：**
+
+1. **`_resubmit_one` (L1129)** — 将 `skipped` 从终端态拦截中移除。改为只拦截真正的终态：
+   ```python
+   if state in ("done", "jky_cancelled", "cancelled"):
+       return {"success": False, "action": "skipped_terminal", ...}
+   ```
+   同时让 `skipped` 走回 `_resubmit_create` 路径。
+
+2. **`_suggest_action` (L841)** — 当前只有 `init/failed/audited + 无 jky_trade_no` 才建议"重新提交到吉客云"，需要加上 `skipped`：
+   ```python
+   if state in ("init", "failed", "audited", "skipped") and not jky_trade_no:
+       return "resubmit-jky"
+   ```
+
+3. **`_classify_drift` (admin.py L610)** — 当前把 `skipped` 归类为终端态低优先级，去掉 `skipped` 使其出现在"待处理"列表前端。
+
+完成上述修改后，重新递交链路：
+1. 前端筛选出 `state=skipped/failed/init`
+2. 点击"重新提交" → 调 `_resubmit_one` → 绕过终端态检查 → 走到 `_resubmit_create`
 3. **走 YX 前缀判断 + sku_mapping 查表 + jky_product_cache 查条码** ← 加入 YX 映射后自动受益
 4. 调 JKY trade_create
-
-所以**不需要新增 API 路由**，只需：
-- 前端筛选出 `state=skipped/failed` 的订单
-- 点击"重新提交"即可触发完整映射查表流程
 
 #### 6.4 批量重提的考虑
 
