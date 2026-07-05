@@ -130,6 +130,19 @@ CREATE TABLE IF NOT EXISTS jky_logistic_cache_changes (
 CREATE INDEX IF NOT EXISTS idx_jlc_changes_logistic ON jky_logistic_cache_changes(jky_logistic_no);
 CREATE INDEX IF NOT EXISTS idx_jlc_changes_time ON jky_logistic_cache_changes(changed_at);
 
+-- 🆕 告警日志表
+CREATE TABLE IF NOT EXISTS alert_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER,
+    platform_order_no TEXT,
+    level TEXT NOT NULL,
+    category TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_alert_log_order ON alert_log(order_id);
+CREATE INDEX IF NOT EXISTS idx_alert_log_created ON alert_log(created_at);
+
 -- 🆕 P2 升级修正: P2→P1 滑动窗口聚合表（按 exception class 聚合）
 CREATE TABLE IF NOT EXISTS alert_counter (
     exception_class TEXT PRIMARY KEY,   -- e.g. 'JKYRateLimitError' / 'JkyOrderCancelRejectedError'
@@ -258,6 +271,11 @@ _MIGRATIONS = [
     "ALTER TABLE order_merge ADD COLUMN target_online_trade_no TEXT",
     "ALTER TABLE order_merge ADD COLUMN jky_status INTEGER",
     "ALTER TABLE order_merge ADD COLUMN order_map_id INTEGER",
+    # 🆕 告警系统: order_map 告警聚合字段
+    "ALTER TABLE order_map ADD COLUMN alert_count INTEGER DEFAULT 0",
+    "ALTER TABLE order_map ADD COLUMN last_alert_level TEXT DEFAULT ''",
+    "ALTER TABLE order_map ADD COLUMN last_alert_time TEXT DEFAULT ''",
+    "ALTER TABLE order_map ADD COLUMN last_alert_message TEXT DEFAULT ''",
 ]
 
 

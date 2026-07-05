@@ -50,6 +50,8 @@ async def run_cron_a(
             )
         except Exception as e:
             logger.error(f"[cron-a] 拉单失败 (page={page}): {e}")
+            if page == 1 and notifier:
+                await notifier.alert_p1("cron-a", f"蓝盟拉单 page=1 失败: {e}", 0, 0)
             break
         if resp.get("code") != 0:
             logger.warning(f"[cron-a] 蓝盟查询异常 (page={page}): code={resp.get('code')} msg={resp.get('msg','')}")
@@ -230,6 +232,8 @@ async def run_cron_a(
             jky_code = create_resp.get("code", -1)
             if jky_code != 200:
                 logger.error(f"[cron-a] {order_no} 创单失败: {create_resp}")
+                if notifier:
+                    await notifier.alert_p1(order_no, f"JKY 创单失败: {create_resp.get('msg','')} (code={jky_code})", 0, map_id)
                 conn.execute(
                     "UPDATE order_map SET jky_state = NULL, jky_unified = NULL, bridge_unified = NULL WHERE id = ?",
                     (map_id,),
@@ -242,6 +246,18 @@ async def run_cron_a(
                            .get("data", {})
                            .get("tradeOrder", {})
                            .get("tradeNo", ""))
+            if not jky_trade_no:
+                msg = f"JKY 创单返回但缺 tradeNo: {json.dumps(create_resp, ensure_ascii=False)[:200]}"
+                logger.error(f"[cron-a] {order_no} {msg}")
+                if notifier:
+                    await notifier.alert_p0(order_no, msg, map_id, "jky_created")
+                conn.execute(
+                    "UPDATE order_map SET jky_state = NULL, jky_unified = NULL, bridge_unified = NULL WHERE id = ?",
+                    (map_id,),
+                )
+                conn.commit()
+                st_transition(map_id, STATE_FAILED, "cron_a", msg)
+                continue
             # 假设刚创建的 JKY 单是 1010(待审核) 状态
             jky_state = "1010"
             jky_unified = jky_to_unified(jky_state)

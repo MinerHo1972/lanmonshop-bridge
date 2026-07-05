@@ -670,6 +670,7 @@ async def run_cron_f(
                     f"[cron-f] 警告: JKY 全量拉取失败 (重试耗尽): {e}\n"
                     "JKY 侧状态不可用于对账"
                 )
+                await notifier.alert_p1("cron-f", f"JKY 全量拉取全部窗口失败 (重试耗尽): {e}", 0, 0)
                 break
 
     # ---- 3b. 兜底刷新 DB 统一态字段 ----

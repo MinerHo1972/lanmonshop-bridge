@@ -48,6 +48,8 @@ async def run_cron_b(
         all_jky = await pull_jky_trades_multi_window(jky, JKY_LOOKBACK_DAYS)
     except Exception as e:
         logger.error(f"[cron-b] JKY 全量拉取失败: {e}")
+        if notifier:
+            await notifier.alert_p1("cron-b", f"JKY 全量拉取全部窗口失败: {e}", 0, 0)
 
     if not all_jky:
         logger.info("[cron-b] JKY 无订单数据")

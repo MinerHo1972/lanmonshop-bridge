@@ -14,6 +14,51 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin")
 
+
+def record_admin_alert(conn, notifier, order_id: int,
+                       platform_order_no: str,
+                       level: str, category: str, message: str,
+                       resolved: bool = False):
+    """事务性记录 admin 操作告警
+
+    - 脱敏：消息截断 200 字
+    - 写 alert_log + 更新 order_map 聚合字段
+    - 调 notifier（fire-and-forget via create_task）
+    - resolved=True → 清零该订单告警计数（修复成功后调用）
+    """
+    import asyncio
+    safe_msg = message[:200]
+    if resolved:
+        conn.execute(
+            "UPDATE order_map SET alert_count = 0, last_alert_level = '',"
+            "last_alert_time = '', last_alert_message = '' WHERE id = ?",
+            (order_id,)
+        )
+        conn.commit()
+        return
+
+    loop = asyncio.get_event_loop()
+    if level == "P0":
+        loop.create_task(notifier.alert_p0(platform_order_no, safe_msg, order_id, "admin"))
+    elif level == "P1":
+        loop.create_task(notifier.alert_p1(platform_order_no, safe_msg, 0, order_id))
+    elif level == "P2":
+        loop.create_task(notifier.alert_p2(level, safe_msg, category=category))
+
+    conn.execute(
+        "INSERT INTO alert_log (order_id, platform_order_no, level, category, message) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (order_id, platform_order_no, level, category, safe_msg)
+    )
+    conn.execute(
+        "UPDATE order_map SET alert_count = alert_count + 1,"
+        "last_alert_level = ?,"
+        "last_alert_time = strftime('%Y-%m-%d %H:%M:%S','now'),"
+        "last_alert_message = ? WHERE id = ?",
+        (level, safe_msg, order_id)
+    )
+    conn.commit()
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -132,7 +177,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div id="recon-result"></div>
     <table><thead><tr>
       <th style="width:30px"><input type="checkbox" id="recon-select-all" onchange="toggleAll()"></th>
-      <th>ID</th><th>平台单号</th><th>🟢 蓝盟</th><th>🔷 桥(DB)</th><th>🔴 吉客云</th><th>三端一致</th><th>吉客云单号</th><th>物流单号</th><th>错误/备注</th><th>更新于</th><th style="width:60px">日志</th>
+      <th>ID</th><th>平台单号</th><th>🟢 蓝盟</th><th>🔷 桥(DB)</th><th>🔴 吉客云</th><th>三端一致</th><th>吉客云单号</th><th>物流单号</th><th>错误/备注</th><th>🚨 告警</th><th>更新于</th><th style="width:60px">日志</th>
     </tr></thead>
     <tbody id="recon-rows"></tbody></table>
     <div class="pagination" id="recon-pagination" style="margin-top:8px">
@@ -213,6 +258,24 @@ function timeStr(t){
   return d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}).replace(/\//g,'-');
 }
 function trunc(s,l){if(!s)return'-';s=s.slice(0,l);return s}
+function alertBadge(count, level){
+  if(!count||count===0)return'';
+  const colors={P0:'badge-err',P1:'badge-warn',P2:'badge-init'};
+  return'<span class="badge '+(colors[level]||'badge-warn')+'" style="cursor:pointer" onclick="event.stopPropagation();showAlertLog('+count+')" title="'+level+' · 点击查看详情">🔔'+count+'</span>'
+}
+async function showAlertLog(orderId){
+  try{
+    const r=await(await fetch('/admin/api/alerts?order_id='+orderId+'&limit=20')).json();
+    const html=r.alerts.map(a=>'<div style="padding:4px 0;border-bottom:1px solid #30363d;font-size:12px">'+
+      '<span class="badge '+(a.level==='P0'?'badge-err':a.level==='P1'?'badge-warn':'badge-init')+'">'+a.level+'</span> '+
+      '<span class="ttl">'+a.category+'</span> '+
+      '<span style="color:#c9d1d9">'+a.message.slice(0,200)+'</span>'+
+      ' <span class="ttl">'+timeStr(a.created_at)+'</span>'+
+      '</div>').join('')||'<div class="empty">无告警</div>';
+    document.getElementById('modal-body').innerHTML=html;
+    document.getElementById('body-modal').classList.add('show');
+  }catch(e){alert('加载告警失败: '+e.message)}
+}
 
 async function loadCrons(){
   try{
@@ -304,9 +367,10 @@ async function loadRecon(page){
       '<td class="code">'+(o.jky_trade_no||'-')+'</td>'+
       '<td class="code">'+(o.logistic_no||'-')+'</td>'+
       '<td class="ttl" style="max-width:180px;overflow:hidden;text-overflow:ellipsis">'+(o.last_error||'')+'</td>'+
+      '<td style="text-align:center">'+alertBadge(o.alert_count, o.last_alert_level)+'</td>'+
       '<td class="ttl">'+timeStr(o.updated_at)+'</td>'+
       '<td><button class="expand-btn" onclick="event.stopPropagation();switchToLogs(\''+o.platform_order_no+'\')">📋</button></td>'+
-    '</tr>').join('')||'<tr><td colspan="12" class="empty">无待处理订单</td></tr>';
+    '</tr>').join('')||'<tr><td colspan="13" class="empty">无待处理订单</td></tr>';
     // 分页控件
     reconTotalPages=r.total_pages||1;
     document.getElementById('recon-page-info').textContent='共 '+r.total+' 条 / 第 '+r.page+'/'+r.total_pages+' 页';
@@ -744,7 +808,8 @@ async def api_reconciliation(request: Request, page: int = 1, page_size: int = 5
     rows = conn.execute(
         """SELECT id, platform_order_no, platform_state, jky_trade_no,
                   logistic_no, state, retry_count, last_error, updated_at,
-                  platform_unified, jky_unified, jky_effective_unified, bridge_unified, jky_state
+                  platform_unified, jky_unified, jky_effective_unified, bridge_unified, jky_state,
+                  alert_count, last_alert_level, last_alert_time, last_alert_message
            FROM order_map
            WHERE updated_at >= ?
            ORDER BY
@@ -754,6 +819,7 @@ async def api_reconciliation(request: Request, page: int = 1, page_size: int = 5
                WHEN state IN ('jky_created','audited') THEN 2
                ELSE 3
              END,
+             alert_count DESC,
              updated_at DESC
            LIMIT ? OFFSET ?""",
         (cutoff, page_size, offset),
@@ -781,6 +847,10 @@ async def api_reconciliation(request: Request, page: int = 1, page_size: int = 5
             "retry_count": r["retry_count"],
             "last_error": r["last_error"],
             "updated_at": str(r["updated_at"]) if r["updated_at"] else None,
+            "alert_count": r["alert_count"] or 0,
+            "last_alert_level": r["last_alert_level"] or "",
+            "last_alert_time": r["last_alert_time"] or "",
+            "last_alert_message": r["last_alert_message"] or "",
             # 统一态字段
             "platform_unified": r["platform_unified"] or _lanmong_label(r["platform_state"]),
             "bridge_unified": r["bridge_unified"] or _bridge_label(r["state"]),
@@ -1035,6 +1105,7 @@ async def api_recon_resubmit_lanmong(request: Request):
     conn = get_connection()
     lanmong = getattr(request.app.state, "lanmong_client", None)
     jky = getattr(request.app.state, "jky_client", None)
+    notifier = getattr(request.app.state, "notifier", None)
     results = []
 
     for order_id in ids:
@@ -1047,13 +1118,25 @@ async def api_recon_resubmit_lanmong(request: Request):
             results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": "未找到"})
             continue
         if not row["jky_trade_no"]:
-            results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": "缺 JKY 单号"})
+            msg = "缺 JKY 单号"
+            if notifier:
+                record_admin_alert(conn, notifier, order_id, row["platform_order_no"],
+                    "P1", "resubmit_lanmong_fail", msg)
+            results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": msg})
             continue
         if not row["logistic_no"]:
-            results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": "缺物流单号，无法回传"})
+            msg = "缺物流单号，无法回传"
+            if notifier:
+                record_admin_alert(conn, notifier, order_id, row["platform_order_no"],
+                    "P1", "resubmit_lanmong_fail", msg)
+            results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": msg})
             continue
         if not lanmong:
-            results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": "蓝盟客户端不可用"})
+            msg = "蓝盟客户端不可用"
+            if notifier:
+                record_admin_alert(conn, notifier, order_id, row["platform_order_no"],
+                    "P1", "resubmit_lanmong_fail", msg)
+            results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": msg})
             continue
 
         try:
@@ -1082,8 +1165,12 @@ async def api_recon_resubmit_lanmong(request: Request):
                     pass
 
             if not order_items:
+                msg = "无商品明细（order_items_json 为空或无有效 orderItemId）"
+                if notifier:
+                    record_admin_alert(conn, notifier, order_id, row["platform_order_no"],
+                        "P2", "resubmit_lanmong_fail", msg)
                 results.append({"id": order_id, "success": False, "action": "resubmit-lanmong",
-                                "msg": "无商品明细（order_items_json 为空或无有效 orderItemId）"})
+                                "msg": msg})
                 continue
 
             resp = await lanmong.sync_order_express(
@@ -1103,14 +1190,26 @@ async def api_recon_resubmit_lanmong(request: Request):
                     results.append({"id": order_id, "success": True, "action": "resubmit-lanmong",
                                     "msg": f"物流已回传蓝盟: {row['logistic_no']}"})
                 else:
+                    msg = f"回传局部失败: {fault_list[0].get('errorMsg','')}"
+                    if notifier:
+                        record_admin_alert(conn, notifier, order_id, row["platform_order_no"],
+                            "P2", "resubmit_lanmong_fail", msg)
                     results.append({"id": order_id, "success": False, "action": "resubmit-lanmong",
-                                    "msg": f"回传局部失败: {fault_list[0].get('errorMsg','')}"})
+                                    "msg": msg})
             else:
+                msg = f"蓝盟回传失败: {resp.get('msg','')}"
+                if notifier:
+                    record_admin_alert(conn, notifier, order_id, row["platform_order_no"],
+                        "P1", "resubmit_lanmong_fail", msg)
                 results.append({"id": order_id, "success": False, "action": "resubmit-lanmong",
-                                "msg": f"蓝盟回传失败: {resp.get('msg','')}"})
+                                "msg": msg})
         except Exception as e:
             logger.exception(f"[resubmit-lanmong] {order_id} 失败: {e}")
-            results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": str(e)})
+            msg = str(e)
+            if notifier:
+                record_admin_alert(conn, notifier, order_id, row["platform_order_no"],
+                    "P1", "resubmit_lanmong_fail", msg)
+            results.append({"id": order_id, "success": False, "action": "resubmit-lanmong", "msg": msg})
 
     return {"success": True, "results": results}
 
@@ -1164,6 +1263,8 @@ async def _resubmit_one(row: dict, app_state) -> dict:
     platform_state = row["platform_state"]
     jky_trade_no = row["jky_trade_no"]
     platform_order_no = row["platform_order_no"]
+    conn = get_connection()
+    notifier = getattr(app_state, "notifier", None)
 
     # Terminal states → skip
     if state in ("done", "jky_cancelled", "cancelled"):
@@ -1177,22 +1278,44 @@ async def _resubmit_one(row: dict, app_state) -> dict:
                 if jky_direct:
                     resp = await jky_direct.trade_cancel(jky_trade_no, "420001")
                     if resp.get("code") != 200:
-                        return {"success": False, "action": "cancel",
-                                "msg": f"JKY 取消失败: {resp.get('msg','')}"}
+                        msg = f"JKY 取消失败: {resp.get('msg','')}"
+                        if notifier:
+                            record_admin_alert(conn, notifier, order_id,
+                                platform_order_no, "P1", "cancel_fail", msg)
+                        return {"success": False, "action": "cancel", "msg": msg}
                     transition(order_id, STATE_JKY_CANCELLED, "admin_resubmit")
+                    if notifier:
+                        record_admin_alert(conn, notifier, order_id,
+                            platform_order_no, "P1", "cancel_success", "已取消 JKY", resolved=True)
                     return {"success": True, "action": "cancel",
                             "msg": f"已取消 JKY {jky_trade_no}"}
                 else:
-                    return {"success": False, "action": "cancel", "msg": "jky_direct 不可用"}
+                    msg = "jky_direct 不可用"
+                    if notifier:
+                        record_admin_alert(conn, notifier, order_id,
+                            platform_order_no, "P1", "cancel_fail", msg)
+                    return {"success": False, "action": "cancel", "msg": msg}
             else:
                 # No JKY trade → just mark cancelled
                 transition(order_id, "cancelled", "admin_resubmit",
                            f"platform_state={platform_state}, 无 JKY 单")
+                if notifier:
+                    record_admin_alert(conn, notifier, order_id,
+                        platform_order_no, "P1", "cancel_success", "标记取消", resolved=True)
                 return {"success": True, "action": "mark_cancelled", "msg": "标记取消"}
 
         # Case 2: init or failed → re-create
         if state in ("init", "failed"):
-            return await _resubmit_create(row, app_state)
+            create_result = await _resubmit_create(row, app_state)
+            if not create_result.get("success") and notifier:
+                record_admin_alert(conn, notifier, order_id,
+                    platform_order_no, "P1", "create_fail",
+                    create_result.get("msg", "创单失败"))
+            elif create_result.get("success") and notifier:
+                record_admin_alert(conn, notifier, order_id,
+                    platform_order_no, "P1", "create_success",
+                    "创单成功", resolved=True)
+            return create_result
 
         # Case 3: jky_created or audited → 已有 JKY 单, 通知用户在 JKY 后台手动审核
         if state in ("jky_created", "audited"):
@@ -1201,14 +1324,22 @@ async def _resubmit_one(row: dict, app_state) -> dict:
                         "msg": f"JKY 单 {jky_trade_no} 已存在, 请在 JKY 后台手动审核"}
             else:
                 # No JKY trade → re-create
-                return await _resubmit_create(row, app_state)
+                create_result = await _resubmit_create(row, app_state)
+                if not create_result.get("success") and notifier:
+                    record_admin_alert(conn, notifier, order_id,
+                        platform_order_no, "P1", "create_fail",
+                        create_result.get("msg", "创单失败"))
+                return create_result
 
-        # Case 4: jky_shipped or synced → already in pipeline, inform
+        # Case 4: jky_shipped or synced → already in pipeline
         return {"success": False, "action": "in_pipeline", "msg": f"状态 {state} 已在流程中"}
 
     except Exception as e:
         logger.exception(f"[resubmit] {order_id} 处理异常: {e}")
         transition(order_id, STATE_FAILED, "admin_resubmit", str(e))
+        if notifier:
+            record_admin_alert(conn, notifier, order_id,
+                platform_order_no, "P1", "resubmit_error", str(e))
         return {"success": False, "action": "error", "msg": str(e)}
 
 
@@ -1223,6 +1354,8 @@ async def _resubmit_create(row: dict, app_state) -> dict:
 
     jky_direct = app_state.jky_direct
     lanmong = app_state.lanmong_client
+    notifier = getattr(app_state, "notifier", None)
+    conn = get_connection()
 
     if not jky_direct or not lanmong:
         return {"success": False, "action": "create", "msg": "客户端不可用"}
@@ -1352,8 +1485,11 @@ async def _resubmit_create(row: dict, app_state) -> dict:
                        .get("tradeOrder", {})
                        .get("tradeNo", ""))
         if not new_trade_no:
-            return {"success": False, "action": "create",
-                    "msg": f"JKY 创单返回但缺 tradeNo: {json.dumps(create_resp, ensure_ascii=False)}"}
+            msg = f"JKY 创单返回但缺 tradeNo: {json.dumps(create_resp, ensure_ascii=False)}"
+            if notifier:
+                record_admin_alert(conn, notifier, order_id,
+                    platform_order_no, "P0", "create_missing_trade_no", msg)
+            return {"success": False, "action": "create", "msg": msg}
         conn.execute(
             "UPDATE order_map SET jky_trade_no = ?, order_items_json = ? WHERE id = ?",
             (new_trade_no, json.dumps(products, ensure_ascii=False, default=str), order_id),
@@ -1400,40 +1536,35 @@ async def api_recon_reports(request: Request, limit: int = Query(10, ge=1, le=90
 
 
 @router.get("/api/reconciliation/reports/{report_id}")
-async def api_recon_report_detail(report_id: int, request: Request):
-    """获取单份对账日报的完整详情"""
+async def api_recon_report_detail(request: Request, report_id: int):
     user = await get_current_user(request)
     if not user:
         raise HTTPException(status_code=401)
     conn = get_connection()
     row = conn.execute(
-        "SELECT * FROM reconciliation_report WHERE id = ?",
-        (report_id,),
+        "SELECT * FROM reconciliation_report WHERE id = ?", (report_id,)
     ).fetchone()
     if not row:
-        return {"error": "not_found"}
+        return {"error": "not found"}
+    return dict(row)
 
-    deviations = json.loads(row["deviations_json"] or "[]")
-    trend = json.loads(row["daily_trend_json"] or "[]")
-    summary = json.loads(row["summary_json"])
 
-    # 对偏差增加 DB 实时状态（如 jky_trade_no 可查最新 state）
-    for d in deviations:
-        if d.get("order_no"):
-            o = conn.execute(
-                "SELECT state, jky_trade_no, logistic_no, platform_state, last_error "
-                "FROM order_map WHERE platform_order_no = ? ORDER BY id DESC LIMIT 1",
-                (d["order_no"],),
-            ).fetchone()
-            if o:
-                d["db_current_state"] = o["state"]
-
-    return {
-        "id": row["id"],
-        "report_date": row["report_date"],
-        "run_id": row["run_id"],
-        "summary": summary,
-        "deviations": deviations,
-        "trend": trend,
-        "created_at": str(row["created_at"]) if row["created_at"] else None,
-    }
+@router.get("/api/alerts")
+async def api_alerts(request: Request, order_id: int = None,
+                     level: str = None, limit: int = Query(50, ge=1, le=200)):
+    """查询告警日志"""
+    user = await get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401)
+    conn = get_connection()
+    where = []
+    params = []
+    if order_id is not None:
+        where.append("order_id = ?"); params.append(order_id)
+    if level:
+        where.append("level = ?"); params.append(level)
+    where_clause = " WHERE " + " AND ".join(where) if where else ""
+    sql = f"SELECT * FROM alert_log{where_clause} ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return {"alerts": [dict(r) for r in rows]}

@@ -55,6 +55,17 @@ class FeishuNotifier:
         )
         await self._send(text)
 
+    async def alert_p2(self, error_type: str, detail: str,
+                       category: str = "", count: int = 0):
+        """P2 低优先级告警 — 不影响主流程，但需知晓"""
+        text = (
+            f"ℹ️ [P2 {error_type}]\n"
+            f"{detail}\n"
+        )
+        if count:
+            text += f"累计: {count} 次"
+        await self._send(text)
+
     async def alert_p2_upgrade(self, error_type: str, error_detail: str,
                                 count: int, affected: int):
         """P2 → P1 升级告警"""
