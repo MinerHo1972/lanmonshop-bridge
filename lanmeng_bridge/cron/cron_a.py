@@ -15,8 +15,11 @@ from ..core.exception_handler import RetryState, classify_error, Severity
 from ..core.shared_unified import platform_to_unified, jky_to_unified, bridge_to_unified
 from ..notify.feishu import FeishuNotifier
 from ..storage.db import get_connection, get_cursor, set_cursor
+from ..core.sku_resolver import SkuResolver
 
 logger = logging.getLogger(__name__)
+
+_resolver = SkuResolver()
 CURSOR_KEY = "cron_a_last_pull"
 LOOKBACK_DAYS = 15
 
@@ -156,26 +159,44 @@ async def run_cron_a(
                 st_transition(map_id, STATE_SKIPPED, "cron_a", "缺 productNo")
                 skip_order = True
                 break
+
+            # YX 前缀转换：正式网站 YX 编码 → sku_mapping → jky_goods_no
+            jky_goods_no = product_no
+            if product_no.startswith("YX"):
+                resolved = _resolver.resolve(product_no)
+                if not resolved:
+                    msg = f"{product_no} 无sku映射（应补 sku_mapping 表）"
+                    logger.warning(f"[cron-a] {order_no} {msg}")
+                    st_transition(map_id, STATE_SKIPPED, "cron_a", msg)
+                    await notifier.alert_p1(
+                        order_no, msg,
+                        retry_count=0, order_map_id=map_id,
+                    )
+                    skip_order = True
+                    break
+                jky_goods_no = resolved
+                logger.info(f"[cron-a] {order_no} YX映射: {product_no} → {jky_goods_no}")
+
             prod_row = conn.execute(
                 "SELECT jky_barcode, jky_goods_name FROM jky_product_cache WHERE jky_goods_no = ?",
-                (product_no,),
+                (jky_goods_no,),
             ).fetchone()
             if not prod_row:
-                logger.warning(f"[cron-a] {order_no} {product_no} 不在缓存")
-                st_transition(map_id, STATE_SKIPPED, "cron_a", f"{product_no} 无缓存")
+                logger.warning(f"[cron-a] {order_no} {jky_goods_no} 不在缓存")
+                st_transition(map_id, STATE_SKIPPED, "cron_a", f"{jky_goods_no} 无缓存")
                 skip_order = True
                 break
             cost_price = float(item.get("costPrice", 0) or 0)
             barcode = prod_row["jky_barcode"]
             if not barcode:
-                logger.warning(f"[cron-a] {order_no} {product_no} 条码为空，跳过")
-                st_transition(map_id, STATE_SKIPPED, "cron_a", f"{product_no} 条码为空")
+                logger.warning(f"[cron-a] {order_no} {jky_goods_no} 条码为空，跳过")
+                st_transition(map_id, STATE_SKIPPED, "cron_a", f"{jky_goods_no} 条码为空")
                 skip_order = True
                 break
             sell_total = round(cost_price * qty, 2)
             order_total += sell_total
             trade_order_details.append({
-                "goodsNo": product_no,
+                "goodsNo": jky_goods_no,
                 "barcode": barcode,
                 "goodsName": prod_row["jky_goods_name"] or "",
                 "specName": "默认", "unit": "件",

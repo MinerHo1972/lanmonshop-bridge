@@ -75,10 +75,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <h1>🔧 Bridge Admin</h1>
-<p class="desc">蓝盟-吉客云云桥接服务 · 运行状态 & API 日志查询 & 三态对账</p>
+<p class="desc">蓝盟-吉客云云桥接服务 · 运行状态 & API 日志查询 & 订单表</p>
 
 <div class="tab-bar">
-  <div class="tab active" onclick="switchTab('recon')">🔄 对账</div>
+  <div class="tab active" onclick="switchTab('recon')">📋 订单表</div>
   <div class="tab" onclick="switchTab('crons')">📊 Cron 状态</div>
   <div class="tab" onclick="switchTab('logs')">📝 API 日志</div>
 </div>
@@ -120,6 +120,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <option value="all">全部状态</option>
         <option value="consistent">✅ 一致</option>
         <option value="inconsistent">❌ 不一致</option>
+        <option value="undelivered">📤 未递交</option>
       </select>
       <select id="recon-action" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 10px;border-radius:4px;font-size:12px">
       </select>
@@ -252,6 +253,11 @@ async function loadLogs(page){
 async function loadRecon(){
   try{
     const r=await(await fetch('/admin/api/reconciliation')).json();
+    const filter=document.getElementById('recon-filter').value;
+    let orders=r.orders;
+    if(filter==='consistent')orders=orders.filter(o=>o.consistent);
+    else if(filter==='inconsistent')orders=orders.filter(o=>!o.consistent);
+    else if(filter==='undelivered')orders=orders.filter(o=>o.state==='init'||o.state==='failed'||o.state==='skipped');
     reconData=r.orders;
     // 五态统计 (以 bridge_unified 为准)
     const FIVE_STATES=['待发货','部分发货','已发货','已完成','已取消/退款'];
@@ -270,9 +276,10 @@ async function loadRecon(){
       FIVE_STATES.map(s=>'<div class="stat-card"><div class="num '+(counts[s]?.inconsistent>0?'red':'')+'">'+(counts[s]?.total||0)+
         '</div><div class="label">'+s+'</div></div>').join('')+
       '<div class="stat-card"><div class="num">'+consistentCount+'</div><div class="label">一致</div></div>'+
-      '<div class="stat-card"><div class="num '+(inconsistentCount>0?'red':'')+'">'+inconsistentCount+'</div><div class="label">不一致</div></div>';
-    // rows
-    document.getElementById('recon-rows').innerHTML=r.orders.map((o,i)=>'<tr id="recon-tr-'+o.id+'" onclick="toggleRow('+o.id+')">'+
+      '<div class="stat-card"><div class="num '+(inconsistentCount>0?'red':'')+'">'+inconsistentCount+'</div><div class="label">不一致</div></div>'+
+      '<div class="stat-card"><div class="num">'+orders.length+'</div><div class="label">当前筛选</div></div>';
+    // rows — 用筛选后的 orders
+    document.getElementById('recon-rows').innerHTML=orders.map((o,i)=>'<tr id="recon-tr-'+o.id+'" onclick="toggleRow('+o.id+')">'+
       '<td><input type="checkbox" class="recon-cb" data-id="'+o.id+'" onchange="toggleRow('+o.id+')" '+(selectedIds.has(o.id)?'checked':'')+'></td>'+
       '<td class="ttl">'+o.id+'</td>'+
       '<td class="code">'+o.platform_order_no+'</td>'+
@@ -607,7 +614,7 @@ def _classify_drift(row: dict) -> tuple[list[str], str]:
     priority = "terminal"
 
     # Terminal states → low priority, only show if stale
-    if state in ("done", "skipped", "jky_cancelled", "cancelled"):
+    if state in ("done", "jky_cancelled", "cancelled"):
         return (["static"], "terminal")
 
     # Lanmeng cancelled but bridge not cancelled
@@ -838,7 +845,7 @@ def _suggest_action(
 ) -> str:
     """根据订单当前状态推荐默认操作"""
     # 缺 JKY 单 → 提交到吉客云
-    if state in ("init", "failed", "audited") and not jky_trade_no:
+    if state in ("init", "failed", "audited", "skipped") and not jky_trade_no:
         return "resubmit-jky"
 
     # 蓝盟已取消但 bridge 未处理 → 从蓝盟拉取
@@ -1126,7 +1133,7 @@ async def _resubmit_one(row: dict, app_state) -> dict:
     platform_order_no = row["platform_order_no"]
 
     # Terminal states → skip
-    if state in ("done", "skipped", "jky_cancelled", "cancelled"):
+    if state in ("done", "jky_cancelled", "cancelled"):
         return {"success": False, "action": "skipped_terminal", "msg": "终态无需处理"}
 
     try:
@@ -1230,19 +1237,33 @@ async def _resubmit_create(row: dict, app_state) -> dict:
         qty = item.get("num") or item.get("number") or 1
         if not product_no:
             continue
+
+        # YX 前缀转换：正式网站 YX 编码 → sku_mapping → jky_goods_no
+        from ..core.sku_resolver import SkuResolver as _SkuResolver
+        _resolver = _SkuResolver()
+        jky_goods_no = product_no
+        if product_no.startswith("YX"):
+            resolved = _resolver.resolve(product_no)
+            if not resolved:
+                msg = f"{product_no} 无sku映射（应补 sku_mapping 表）"
+                logger.warning(f"[resubmit] {platform_order_no} {msg}")
+                return {"success": False, "action": "create", "msg": msg}
+            jky_goods_no = resolved
+            logger.info(f"[resubmit] {platform_order_no} YX映射: {product_no} → {jky_goods_no}")
+
         prod_row = conn.execute(
             "SELECT jky_barcode, jky_goods_name FROM jky_product_cache WHERE jky_goods_no = ?",
-            (product_no,),
+            (jky_goods_no,),
         ).fetchone()
         if not prod_row or not prod_row["jky_barcode"]:
-            logger.warning(f"[resubmit] {platform_order_no} {product_no} 无缓存或条码为空，跳过")
+            logger.warning(f"[resubmit] {platform_order_no} {jky_goods_no} 无缓存或条码为空，跳过")
             return {"success": False, "action": "create",
-                    "msg": f"货品 {product_no} 无缓存或条码为空，无法创单"}
+                    "msg": f"货品 {jky_goods_no} 无缓存或条码为空，无法创单"}
         cost_price = float(item.get("costPrice", 0) or 0)
         sell_total = round(cost_price * qty, 2)
         order_total = (order_total or 0) + sell_total
         trade_order_details.append({
-            "goodsNo": product_no,
+            "goodsNo": jky_goods_no,
             "barcode": prod_row["jky_barcode"],
             "goodsName": prod_row["jky_goods_name"] or "",
             "specName": "默认",

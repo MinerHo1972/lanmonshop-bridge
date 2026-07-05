@@ -251,10 +251,16 @@ def _compare_order_fields(lanmeng_order: dict, jky_trade: dict) -> list[dict]:
     # 5. Product comparison — match by goodsNo/productNo (not by index)
     jky_goods = jky_trade.get("goodsDetail") or []
     if lm_products and jky_goods:
-        # Build indexes by productNo/goodsNo
+        # Build indexes by productNo/goodsNo (YX 前缀转换后以 jky_goods_no 做 key)
+        from ..core.sku_resolver import SkuResolver
+        _resolver_f = SkuResolver()
         lm_by_no = {}
         for p in lm_products:
             no = _safe_str(p.get("productNo"))
+            if no and no.startswith("YX"):
+                jky_no = _resolver_f.resolve(no)
+                if jky_no:
+                    no = jky_no
             if no:
                 lm_by_no[no] = p
         jky_by_no = {}
