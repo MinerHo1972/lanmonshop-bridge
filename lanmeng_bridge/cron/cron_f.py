@@ -45,7 +45,7 @@ LANMENG_STATES = ["-4", "-3", "-2", "1", "2", "3", "4", "6"]
 JKY_SHIPPED_STATUSES = {"9090", "已完成", "已发货", "已签收"}
 
 # JKY 时间范围查询限制：跨度不超过 7 天（否则返回 0040139996）
-JKY_LOOKBACK_DAYS = 7
+JKY_LOOKBACK_DAYS = 14
 JKY_SHOP_IDS = "2154377951944409856"  # 特渠分销对接 店铺 ID
 
 
@@ -650,7 +650,17 @@ async def run_cron_f(
     retry = RetryState(max_attempts=2, backoff_minutes=[5])
     while not retry.is_exhausted:
         try:
-            jky_trades = await _pull_jky_trades(jky, (datetime.now() - timedelta(days=JKY_LOOKBACK_DAYS)).strftime("%Y-%m-%d %H:%M:%S"))
+            jky_trades = await pull_jky_trades_multi_window(
+                jky, JKY_LOOKBACK_DAYS,
+                fields=(
+                    "tradeNo,onlineTradeNo,tradeStatus,tradeStatusExplain,"
+                    "mainPostid,logisticName,shopName,scrollId,"
+                    "receiverName,mobile,phone,state,city,district,address,"
+                    "payment,totalFee,"
+                    "goodsDetail.goodsNo,goodsDetail.goodsName,"
+                    "goodsDetail.sellCount,goodsDetail.sellPrice,goodsDetail.sellTotal"
+                ),
+            )
             break
         except Exception as e:
             retry.record_attempt(str(e))
@@ -663,7 +673,8 @@ async def run_cron_f(
                 break
 
     # ---- 3b. 兜底刷新 DB 统一态字段 ----
-    from ..core.shared_unified import platform_to_unified, resolve_jky_effective_state
+    from ..core.shared_unified import platform_to_unified, resolve_jky_effective_state, \
+        pull_jky_trades_multi_window
     successor_index = {}
     for jky_data in jky_trades.values():
         ts = str(jky_data.get("tradeStatus", "") or "")

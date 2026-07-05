@@ -2,6 +2,11 @@
 
 五态: 待发货, 部分发货, 已发货, 已完成, 已取消/退款
 """
+import logging
+from datetime import datetime, timedelta
+from typing import Optional, List
+
+logger = logging.getLogger(__name__)
 
 # 蓝盟 state → 统一
 _LANMONG_TO_UNIFIED = {
@@ -198,3 +203,90 @@ def find_split_merge_successor(
                 successors.append(trade_no)
 
     return successors
+
+
+# ---------- JKY 多窗口分段拉取（JKY API 限制时间跨度 ≤7 天） ----------
+
+_JKY_DEFAULT_FIELDS = (
+    "tradeNo,onlineTradeNo,tradeStatus,tradeStatusExplain,"
+    "mainPostid,logisticName,shopName,scrollId"
+)
+_JKY_SHOP_IDS = "2154377951944409856"
+
+
+async def pull_jky_trades_range(jky, start_date: str, end_date: str, fields: str = None) -> dict:
+    """单窗口 JKY 全量拉取（scroll 分页），返回 {tradeNo: trade_dict}
+
+    Args:
+        jky: JkyClient 实例
+        start_date: 起始时间（%Y-%m-%d %H:%M:%S 格式）
+        end_date: 结束时间
+        fields: 查询字段，默认 _JKY_DEFAULT_FIELDS
+    """
+    result = {}
+    scroll_id = ""
+    f = fields or _JKY_DEFAULT_FIELDS
+    while True:
+        try:
+            resp = await jky.trade_list({
+                "scrollId": scroll_id,
+                "pageSize": 200,
+                "startModified": start_date,
+                "endModified": end_date,
+                "shopIds": _JKY_SHOP_IDS,
+                "fields": f,
+            })
+        except Exception as e:
+            logger.warning(f"[pull_jky_trades] 拉取失败 ({start_date}~{end_date}): {e}")
+            break
+        if resp.get("code") != 200:
+            break
+        trades = resp.get("result", {}).get("data", {}).get("trades", [])
+        if not trades:
+            break
+        for t in trades:
+            # 双索引：tradeNo + onlineTradeNo（下游代码通过两种 key 查找）
+            tno = t.get("tradeNo") or ""
+            if tno:
+                result[tno] = t
+            ono = t.get("onlineTradeNo") or ""
+            if ono and ono != tno:
+                result[ono] = t
+        scroll_id = resp.get("result", {}).get("data", {}).get("scrollId", "")
+        if not scroll_id or len(trades) < 200:
+            break
+    return result
+
+
+async def pull_jky_trades_multi_window(jky, lookback_days: int, fields: str = None,
+                                       max_window_days: int = 7) -> dict:
+    """多窗口 JKY 拉取：将 lookback_days 切分为 ≤max_window_days 的窗口，合并去重
+
+    JKY API 限制 startModified/endModified 跨度不超过 7 天（否则返回 0040139996）。
+    此函数自动将目标时间范围拆分为多个 7 天窗口逐段拉取，合并结果。
+
+    Args:
+        jky: JkyClient 实例
+        lookback_days: 目标查询天数（如 14）
+        fields: 查询字段，默认 _JKY_DEFAULT_FIELDS
+        max_window_days: 每个窗口最大天数（默认 7，JKY 硬限制）
+    """
+    result = {}
+    now_dt = datetime.now()
+    start_dt = now_dt - timedelta(days=lookback_days)
+
+    # 从最远的窗口开始逐段拉取
+    cursor = start_dt
+    while cursor < now_dt:
+        window_end = min(cursor + timedelta(days=max_window_days), now_dt)
+        start_str = cursor.strftime("%Y-%m-%d %H:%M:%S")
+        end_str = window_end.strftime("%Y-%m-%d %H:%M:%S")
+        chunk = await pull_jky_trades_range(jky, start_str, end_str, fields)
+        logger.info(f"[pull_jky_multi] 窗口 {start_str}~{end_str}: {len(chunk)} 条")
+        for k, v in chunk.items():
+            result[k] = v  # 去重，后拉覆盖前拉（同一单以最新为准）
+        cursor = window_end
+
+    logger.info(f"[pull_jky_multi] 共 {len(result)} 条 (lookback={lookback_days}d, "
+                f"window={max_window_days}d)")
+    return result

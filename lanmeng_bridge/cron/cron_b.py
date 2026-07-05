@@ -13,7 +13,8 @@ from ..core.state_machine import transition as st_transition, STATE_JKY_SHIPPED,
     STATE_DONE, STATE_FAILED
 from ..core.logistic_resolver import LogisticResolver
 from ..core.exception_handler import RetryState, classify_error, Severity
-from ..core.shared_unified import platform_to_unified, bridge_to_unified, resolve_jky_effective_state
+from ..core.shared_unified import platform_to_unified, bridge_to_unified, resolve_jky_effective_state, \
+    pull_jky_trades_multi_window
 from ..notify.feishu import FeishuNotifier
 from ..storage.db import get_connection
 
@@ -21,8 +22,11 @@ logger = logging.getLogger(__name__)
 
 # JKY 全量查询参数
 LOOKBACK_DAYS = 15
-JKY_LOOKBACK_DAYS = 7          # JKY API 限制：时间跨度不超过 7 天
-JKY_SHOP_IDS = "2154377951944409856"  # 特渠分销对接 店铺 ID
+JKY_LOOKBACK_DAYS = 14          # 多窗口分段拉取，每段 ≤7 天（JKY API 硬限制）
+JKY_DEFAULT_FIELDS = (
+    "tradeNo,onlineTradeNo,tradeStatus,tradeStatusExplain,"
+    "mainPostid,logisticName,shopName,scrollId"
+)
 
 
 async def run_cron_b(
@@ -37,47 +41,19 @@ async def run_cron_b(
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cutoff = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
 
-    # ---- Step 1: 拉 JKY 全量（修改时间范围, scroll 分页, 限定店铺+7天窗口）----
-    all_jky = {}  # {onlineTradeNo or tradeNo: trade_data}
-    scroll_id = ""
+    # ---- Step 1: 拉 JKY 全量（多窗口分段拉取，每段 ≤7 天）----
+    all_jky = {}  # {tradeNo or onlineTradeNo: trade_data}
     total_fetched = 0
-    jky_cutoff = (datetime.now() - timedelta(days=JKY_LOOKBACK_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-    while True:
-        try:
-            biz = {
-                "scrollId": scroll_id,
-                "pageSize": 200,
-                "startModified": jky_cutoff,
-                "endModified": now_str,
-                "shopIds": JKY_SHOP_IDS,
-                "fields": "tradeNo,onlineTradeNo,tradeStatus,tradeStatusExplain,"
-                          "mainPostid,logisticName,shopName,scrollId",
-            }
-            resp = await jky.trade_list(biz)
-        except Exception as e:
-            logger.error(f"[cron-b] JKY 全量拉取失败: {e}")
-            break
-        if resp.get("code") != 200:
-            logger.warning(f"[cron-b] JKY 查询异常: {resp}")
-            break
-        trades = resp.get("result", {}).get("data", {}).get("trades", [])
-        if not trades:
-            logger.info("[cron-b] JKY 无更多订单")
-            break
-        for t in trades:
-            # 用 onlineTradeNo 或 tradeNo 做 key
-            key = t.get("onlineTradeNo") or t.get("tradeNo", "")
-            if key:
-                all_jky[key] = t
-        total_fetched += len(trades)
-        scroll_id = resp.get("result", {}).get("data", {}).get("scrollId", "")
-        if not scroll_id or len(trades) < 200:
-            break
+    try:
+        # pull_jky_trades_multi_window 内部按 7 天窗口分段，自动合并去重
+        all_jky = await pull_jky_trades_multi_window(jky, JKY_LOOKBACK_DAYS)
+    except Exception as e:
+        logger.error(f"[cron-b] JKY 全量拉取失败: {e}")
 
     if not all_jky:
         logger.info("[cron-b] JKY 无订单数据")
         return
-    logger.info(f"[cron-b] JKY {total_fetched} 条订单")
+    logger.info(f"[cron-b] JKY {len(all_jky)} 条（含双索引）")
 
     # ---- Step 1.5: 构建拆合单后继索引 ----
     # JKY 合并/拆分后: 原单 tradeStatus=5020, 后继单 onlineTradeNo 含所有原单号(逗号分隔)

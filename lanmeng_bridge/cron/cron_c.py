@@ -11,13 +11,14 @@ from datetime import datetime, timedelta
 from ..clients.jky import JkyClient
 from ..clients.lanmonshop import LanmongClient
 from ..core.state_machine import transition as st_transition, STATE_JKY_CANCELLED
-from ..core.shared_unified import platform_to_unified, resolve_jky_effective_state
+from ..core.shared_unified import platform_to_unified, resolve_jky_effective_state, \
+    pull_jky_trades_multi_window
 from ..notify.feishu import FeishuNotifier
 from ..storage.db import get_connection
 
 logger = logging.getLogger(__name__)
 LOOKBACK_DAYS = 15
-JKY_LOOKBACK_DAYS = 7          # JKY API 限制：时间跨度不超过 7 天
+JKY_LOOKBACK_DAYS = 14
 JKY_SHOP_IDS = "2154377951944409856"  # 特渠分销对接 店铺 ID
 
 
@@ -58,34 +59,11 @@ async def run_cron_c(
         except Exception as e:
             logger.warning(f"[cron-c] 拉蓝盟取消失败: {e}")
 
-    # ---- Step 2: 拉 JKY 全量（15天窗口）用于取消检测+拆合单识别 ----
+    # ---- Step 2: 拉 JKY 全量用于取消检测+拆合单识别 ----
     all_jky = {}   # {tradeNo or onlineTradeNo: trade_data}
     jky_cancelled_ts = {}  # {tradeNo or onlineTradeNo: tradeStatus} 仅真正取消（非拆合单）
     try:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        jky_cutoff = (datetime.now() - timedelta(days=JKY_LOOKBACK_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-        scroll_id = ""
-        while True:
-            resp = await jky.trade_list({
-                "scrollId": scroll_id,
-                "pageSize": 200,
-                "startModified": jky_cutoff,
-                "endModified": now_str,
-                "shopIds": JKY_SHOP_IDS,
-                "fields": "tradeNo,onlineTradeNo,tradeStatus,tradeStatusExplain,mainPostid,scrollId",
-            })
-            if resp.get("code") != 200:
-                break
-            trades = resp.get("result", {}).get("data", {}).get("trades", [])
-            if not trades:
-                break
-            for t in trades:
-                key = t.get("onlineTradeNo") or t.get("tradeNo", "")
-                if key:
-                    all_jky[key] = t
-            scroll_id = resp.get("result", {}).get("data", {}).get("scrollId", "")
-            if not scroll_id or len(trades) < 200:
-                break
+        all_jky = await pull_jky_trades_multi_window(jky, JKY_LOOKBACK_DAYS)
 
         successor_index = {}
         for t_data in all_jky.values():
