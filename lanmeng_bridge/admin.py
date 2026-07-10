@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Query, Request, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from .auth import get_current_user
+from .auth import get_current_user, require_admin
 from .storage.db import get_connection
 
 logger = logging.getLogger(__name__)
@@ -209,13 +209,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
 let curPage=1, totalPages=1, reconData=[], selectedIds=new Set();
 
+async function apiFetch(url, opts){
+  const r=await fetch(url, opts);
+  if(r.status===401){window.location.href='/admin/auth/login';return r}
+  return r
+}
+
 function switchTab(name){
   document.querySelectorAll('.tab,.panel').forEach(e=>e.classList.remove('active'));
-  const idx={crons:1,logs:2,recon:3}[name];
+  const idx={recon:1,crons:2,logs:3,users:4}[name];
   document.querySelector(`.tab:nth-child(${idx})`).classList.add('active');
   document.getElementById(`panel-${name}`).classList.add('active');
   if(name==='crons')loadCrons();
   if(name==='recon'){loadRecon();selectedIds.clear();updateCount()}
+  if(name==='users')loadUsers();
 }
 function showBody(t){document.getElementById('body-modal').classList.add('show');document.getElementById('modal-body').textContent=t}
 function closeModal(){document.getElementById('body-modal').classList.remove('show')}
@@ -265,7 +272,7 @@ function alertBadge(count, level){
 }
 async function showAlertLog(orderId){
   try{
-    const r=await(await fetch('/admin/api/alerts?order_id='+orderId+'&limit=20')).json();
+    const r=await(await apiFetch('/admin/api/alerts?order_id='+orderId+'&limit=20')).json();
     const html=r.alerts.map(a=>'<div style="padding:4px 0;border-bottom:1px solid #30363d;font-size:12px">'+
       '<span class="badge '+(a.level==='P0'?'badge-err':a.level==='P1'?'badge-warn':'badge-init')+'">'+a.level+'</span> '+
       '<span class="ttl">'+a.category+'</span> '+
@@ -279,7 +286,7 @@ async function showAlertLog(orderId){
 
 async function loadCrons(){
   try{
-    const r=await(await fetch('/admin/api/crons')).json();
+    const r=await(await apiFetch('/admin/api/crons')).json();
     document.getElementById('cron-stats').innerHTML='<div class="stat-card"><div class="num">'+r.cursors.length+'</div><div class="label">游标数</div></div><div class="stat-card"><div class="num">'+r.recent_calls+'</div><div class="label">今日 API 调用</div></div>';
     document.getElementById('cron-cursors').innerHTML=r.cursors.map(c=>'<tr><td>'+c.key+'</td><td class="code">'+c.value+'</td><td class="ttl">'+timeStr(c.updated)+'</td></tr>').join('')||'<tr><td colspan="3" class="empty">暂无数据</td></tr>';
     document.getElementById('cron-recent').innerHTML=r.recent.map(l=>'<tr><td>'+l.source+'</td><td class="code">'+l.method+'</td><td>'+statusBadge(l.http_status)+'</td><td>'+apiCodeBadge(l.api_code)+'</td><td>'+durStr(l.duration_ms)+'</td><td class="ttl">'+timeStr(l.created_at)+'</td></tr>').join('')||'<tr><td colspan="6" class="empty">暂无数据</td></tr>';
@@ -299,7 +306,7 @@ async function loadLogs(page){
   if(status)params.set('status',status);
   if(q)params.set('q',q);
   try{
-    const r=await(await fetch('/admin/api/logs?'+params)).json();
+    const r=await(await apiFetch('/admin/api/logs?'+params)).json();
     totalPages=r.total_pages;
     document.getElementById('log-rows').innerHTML=r.rows.map(l=>'<tr>'+
       '<td class="ttl">'+l.id+'</td>'+
@@ -327,7 +334,7 @@ let reconTotalPages=1;
 async function loadRecon(page){
   reconPage=page||1;
   try{
-    const r=await(await fetch('/admin/api/reconciliation?page='+reconPage+'&page_size=50')).json();
+    const r=await(await apiFetch('/admin/api/reconciliation?page='+reconPage+'&page_size=50')).json();
     const filter=document.getElementById('recon-filter').value;
     let orders=r.orders;
     if(filter==='consistent')orders=orders.filter(o=>o.consistent);
@@ -369,7 +376,7 @@ async function loadRecon(page){
       '<td class="ttl" style="max-width:180px;overflow:hidden;text-overflow:ellipsis">'+(o.last_error||'')+'</td>'+
       '<td style="text-align:center">'+alertBadge(o.alert_count, o.last_alert_level)+'</td>'+
       '<td class="ttl">'+timeStr(o.updated_at)+'</td>'+
-      '<td><button class="expand-btn" onclick="event.stopPropagation();switchToLogs(\''+o.platform_order_no+'\')">📋</button></td>'+
+      '<td><button class="expand-btn" onclick="event.stopPropagation();switchToLogs(&#39;'+o.platform_order_no+'&#39;)">📋</button></td>'+
     '</tr>').join('')||'<tr><td colspan="13" class="empty">无待处理订单</td></tr>';
     // 分页控件
     reconTotalPages=r.total_pages||1;
@@ -434,7 +441,7 @@ async function doAction(){
   document.getElementById('recon-resubmit').disabled=true;
   document.getElementById('recon-result').innerHTML='<div class="result-msg ok">'+label+'中 ('+ids.length+' 条)...</div>';
   try{
-    const r=await(await fetch(ACTION_URLS[action],{
+    const r=await(await apiFetch(ACTION_URLS[action],{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({ids}),
     })).json();
@@ -456,6 +463,68 @@ function updateCount(){
   document.getElementById('recon-count').textContent='已选 '+selectedIds.size+' 条';
   document.getElementById('recon-resubmit').disabled=selectedIds.size===0;
   updateActionSelect();
+}
+
+// ---- 用户管理 ----
+
+async function loadUsers(){
+  try{
+    const users=await(await apiFetch('/admin/api/users')).json();
+    document.getElementById('users-rows').innerHTML=(users||[]).map(u=>
+      '<tr><td class="code" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">'+u.open_id+'</td>'+
+      '<td>'+u.name+'</td>'+
+      '<td><span class="badge '+(u.role==='admin'?'badge-err':'badge-init')+'">'+u.role+'</span></td>'+
+      '<td class="ttl">'+(u.added_by||'-')+'</td>'+
+      '<td class="ttl">'+timeStr(u.added_at)+'</td>'+
+      '<td>'+(u.role==='admin'?'<span class="ttl">不可删除</span>':'<button class="expand-btn" onclick="deleteUser(&#39;'+u.open_id+'&#39;,&#39;'+u.name+'&#39;)">删除</button>')+'</td>'+
+      '</tr>'
+    ).join('')||'<tr><td colspan="6" class="empty">无已授权用户</td></tr>';
+  }catch(e){document.getElementById('users-rows').innerHTML='<tr><td colspan="6" class="empty">加载失败: '+e.message+'</td></tr>'}
+
+  try{
+    const pending=await(await apiFetch('/admin/api/users/pending')).json();
+    document.getElementById('pending-rows').innerHTML=(pending||[]).map(p=>
+      '<tr><td class="code" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">'+p.open_id+'</td>'+
+      '<td>'+p.name+'</td>'+
+      '<td class="ttl">'+timeStr(p.created_at)+'</td>'+
+      '<td>'+
+        '<button class="expand-btn" onclick="approveUser(&#39;'+p.open_id+'&#39;,&#39;'+p.name+'&#39;)" style="color:#3fb950">批准</button> '+
+        '<button class="expand-btn" onclick="rejectUser(&#39;'+p.open_id+'&#39;,&#39;'+p.name+'&#39;)" style="color:#f85149">拒绝</button>'+
+      '</td></tr>'
+    ).join('')||'<tr><td colspan="4" class="empty">无待审批用户</td></tr>';
+  }catch(e){document.getElementById('pending-rows').innerHTML='<tr><td colspan="4" class="empty">加载失败: '+e.message+'</td></tr>'}
+}
+
+async function approveUser(openId, name){
+  if(!confirm('批准 '+name+' 的访问权限？'))return;
+  try{
+    const r=await(await apiFetch('/admin/api/users/approve',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({open_id:openId}),
+    })).json();
+    if(r.success){loadUsers();alert('已批准: '+name)}else{alert('批准失败: '+(r.error||''))}
+  }catch(e){alert('请求异常: '+e.message)}
+}
+
+async function rejectUser(openId, name){
+  if(!confirm('拒绝 '+name+' 的审批申请？'))return;
+  try{
+    const r=await(await apiFetch('/admin/api/users/reject',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({open_id:openId}),
+    })).json();
+    if(r.success){loadUsers();alert('已拒绝: '+name)}else{alert('拒绝失败: '+(r.error||''))}
+  }catch(e){alert('请求异常: '+e.message)}
+}
+
+async function deleteUser(openId, name){
+  if(!confirm('确认移除成员 '+name+' 的访问权限？（将同时销毁其所有活跃 session）'))return;
+  if(!confirm('再次确认：移除后将立即生效，'+name+' 将在下次登录后重新提交审批。'))return;
+  try{
+    const r=await(await apiFetch('/admin/api/users/'+encodeURIComponent(openId),{method:'DELETE'})).json();
+    if(r.success){loadUsers();alert('已移除: '+name+(r.sessions_cleared?' (已清除 '+r.sessions_cleared+' 个 session)':''))}
+    else{alert('移除失败: '+(r.error||''))}
+  }catch(e){alert('请求异常: '+e.message)}
 }
 
 document.addEventListener('DOMContentLoaded',()=>{loadRecon(1);loadCrons();loadLogs(1)});
@@ -480,7 +549,7 @@ function switchReconSub(name){
 async function loadReports(){
   try{
     // Try to load report detail (reports list first to find latest with deviations)
-    const list=await(await fetch('/admin/api/reconciliation/reports?limit=5')).json();
+    const list=await(await apiFetch('/admin/api/reconciliation/reports?limit=5')).json();
     // stats from latest report
     if(list.reports&&list.reports.length>0){
       const latest=list.reports[0];
@@ -501,7 +570,7 @@ async function loadReports(){
         '<td>'+r.summary.pending+'</td>'+
       '</tr>').join('')||'<tr><td colspan="7" class="empty">暂无报告</td></tr>';
       // load detail for deviations
-      const detail=await(await fetch('/admin/api/reconciliation/reports/'+latest.id)).json();
+      const detail=await(await apiFetch('/admin/api/reconciliation/reports/'+latest.id)).json();
       document.getElementById('report-deviations').innerHTML=(detail.deviations||[]).map(d=>'<tr>'+
         '<td class="code">'+(d.order_no||'-')+'</td>'+
         '<td>'+stateBadge(d.db_state||d.db_current_state||'-')+'</td>'+
@@ -529,14 +598,46 @@ async def admin_index(request: Request):
     user = await get_current_user(request)
     if not user:
         return RedirectResponse(url="/admin/auth/login")
+
+    role = user.get("role", "")
+    if role not in ("admin", "member"):
+        return RedirectResponse(url="/admin/auth/pending")
+
     # 注入用户信息到 dashboard
     html = DASHBOARD_HTML.replace(
         '</h1>',
         f'</h1> <span style="font-size:12px;color:#8b949e;margin-left:12px">'
-        f'{user.get("name","")} · <a href="/admin/auth/logout" '
+        f'{user.get("name","")} · {"管理员" if role=="admin" else "成员"} · '
+        f'<a href="/admin/auth/logout" '
         f'style="color:#8b949e;text-decoration:underline">退出</a></span>',
         1,
     )
+
+    # member 不可见用户管理 tab，也不可见用户管理面板
+    if role == "admin":
+        # 注入用户管理 tab（在日志 tab 之后，对账 tab 之前）
+        users_tab = '<div class="tab" onclick="switchTab(\'users\')">👥 用户管理</div>'
+        html = html.replace(
+            '<div class="tab" onclick="switchTab(\'logs\')">📝 API 日志</div>',
+            '<div class="tab" onclick="switchTab(\'logs\')">📝 API 日志</div>' + users_tab,
+            1,
+        )
+        # 注入用户管理面板 HTML
+        users_panel = (
+            '<div id="panel-users" class="panel">\n'
+            '  <div class="action-bar">\n'
+            '    <h2 style="margin:0;font-size:16px;color:#f0f6fc;border:none">已授权用户</h2>\n'
+            '  </div>\n'
+            '  <table><thead><tr><th>Open ID</th><th>姓名</th><th>角色</th><th>授权人</th>'
+            '<th>授权时间</th><th>操作</th></tr></thead>\n'
+            '  <tbody id="users-rows"></tbody></table>\n'
+            '  <h2 style="margin-top:24px">待审批用户</h2>\n'
+            '  <table><thead><tr><th>Open ID</th><th>姓名</th><th>申请时间</th><th>操作</th></tr></thead>\n'
+            '  <tbody id="pending-rows"></tbody></table>\n'
+            '</div>'
+        )
+        html = html.replace('<div id="panel-recon"', users_panel + '<div id="panel-recon"', 1)
+
     return html
 
 
@@ -921,13 +1022,6 @@ def _jky_label(state: str, jky_trade_no, logistic_no) -> str:
         return "待发货"
     return "已创建"
 
-
-def _triple_consistent(lanmong_state, state: str, jky_trade_no, logistic_no) -> bool:
-    """三端是否一致：直接对比三端标签，完全一样才一致"""
-    lm_label = _lanmong_label(lanmong_state)
-    br_label = _bridge_label(state)
-    jk_label = _jky_label(state, jky_trade_no, logistic_no)
-    return lm_label == br_label == jk_label
 
 
 # ---- 推荐操作逻辑 ----
@@ -1568,3 +1662,157 @@ async def api_alerts(request: Request, order_id: int = None,
     params.append(limit)
     rows = conn.execute(sql, params).fetchall()
     return {"alerts": [dict(r) for r in rows]}
+
+
+# ---- 用户管理 API（仅 admin 可用，require_admin 校验）----
+
+
+@router.get("/api/users")
+async def api_users_list(request: Request):
+    """列出已授权的所有用户"""
+    await require_admin(request)
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT open_id, name, avatar, role, added_by, added_at FROM admin_users ORDER BY role DESC, added_at"
+    ).fetchall()
+    return [
+        {
+            "open_id": r["open_id"],
+            "name": r["name"],
+            "avatar": r["avatar"],
+            "role": r["role"],
+            "added_by": r["added_by"] or "",
+            "added_at": str(r["added_at"]) if r["added_at"] else "",
+        }
+        for r in rows
+    ]
+
+
+@router.get("/api/users/pending")
+async def api_users_pending(request: Request):
+    """列出待审批用户"""
+    await require_admin(request)
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT open_id, name, avatar, created_at FROM pending_admin_users ORDER BY created_at DESC"
+    ).fetchall()
+    return [
+        {
+            "open_id": r["open_id"],
+            "name": r["name"],
+            "avatar": r["avatar"],
+            "created_at": str(r["created_at"]) if r["created_at"] else "",
+        }
+        for r in rows
+    ]
+
+
+@router.post("/api/users/approve")
+async def api_users_approve(request: Request):
+    """批准待审批用户
+
+    P0 #2 事务包裹: INSERT admin_users + DELETE pending 在一个事务内。
+    """
+    await require_admin(request)
+    current_user = await require_admin(request)
+    body = await request.json()
+    open_id = body.get("open_id", "")
+    if not open_id:
+        return {"success": False, "error": "缺少 open_id"}
+
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN")
+        # 查 pending 记录
+        pending = conn.execute(
+            "SELECT name, avatar FROM pending_admin_users WHERE open_id = ?",
+            (open_id,),
+        ).fetchone()
+        if not pending:
+            conn.execute("ROLLBACK")
+            return {"success": False, "error": "该用户不在待审批列表中"}
+
+        # INSERT admin_users
+        conn.execute(
+            "INSERT OR REPLACE INTO admin_users (open_id, name, avatar, role, added_by) VALUES (?, ?, ?, 'member', ?)",
+            (open_id, pending["name"], pending["avatar"], current_user.get("name", "")),
+        )
+
+        # DELETE pending
+        conn.execute(
+            "DELETE FROM pending_admin_users WHERE open_id = ?",
+            (open_id,),
+        )
+        conn.commit()
+        logger.info(f"[admin] 管理员 {current_user.get('name')} 批准用户 {pending['name']} ({open_id[:16]}...)")
+        return {"success": True}
+    except Exception as e:
+        conn.rollback()
+        logger.exception(f"[admin] 批准用户失败: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@router.post("/api/users/reject")
+async def api_users_reject(request: Request):
+    """拒绝待审批用户（P1: 审计日志）"""
+    await require_admin(request)
+    current_user = await require_admin(request)
+    body = await request.json()
+    open_id = body.get("open_id", "")
+    if not open_id:
+        return {"success": False, "error": "缺少 open_id"}
+
+    conn = get_connection()
+    pending = conn.execute(
+        "SELECT name FROM pending_admin_users WHERE open_id = ?",
+        (open_id,),
+    ).fetchone()
+    if not pending:
+        return {"success": False, "error": "该用户不在待审批列表中"}
+
+    name = pending["name"]
+    conn.execute("DELETE FROM pending_admin_users WHERE open_id = ?", (open_id,))
+    conn.commit()
+    logger.warning(f"[admin] 管理员 {current_user.get('name')} 拒绝用户 {name} ({open_id[:16]}...) 的审批申请")
+    return {"success": True}
+
+
+@router.delete("/api/users/{open_id}")
+async def api_users_delete(request: Request, open_id: str):
+    """删除已授权用户
+
+    P0 #3: 不能删自己
+    P2 #6: 同时清除该用户所有活跃 session
+    """
+    await require_admin(request)
+    current_user = await require_admin(request)
+
+    if open_id == current_user["open_id"]:
+        return {"success": False, "error": "不能删除自己的账号"}
+
+    conn = get_connection()
+    user = conn.execute(
+        "SELECT open_id, name, role FROM admin_users WHERE open_id = ?",
+        (open_id,),
+    ).fetchone()
+    if not user:
+        return {"success": False, "error": "未找到该用户"}
+
+    if user["role"] == "admin":
+        return {"success": False, "error": "不能删除管理员账号"}
+
+    name = user["name"]
+
+    # P2 #6: 清除该用户所有活跃 session，使其立即失效
+    sessions_cleared = conn.execute(
+        "DELETE FROM sessions WHERE user_open_id = ?",
+        (open_id,),
+    ).rowcount
+    conn.execute("DELETE FROM admin_users WHERE open_id = ?", (open_id,))
+    conn.commit()
+
+    logger.warning(
+        f"[admin] 管理员 {current_user.get('name')} 移除用户 {name} "
+        f"({open_id[:16]}...), 已清除 {sessions_cleared} 个 session"
+    )
+    return {"success": True, "sessions_cleared": sessions_cleared}
