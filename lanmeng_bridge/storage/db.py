@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS sku_mapping (
     platform_sku_no TEXT PRIMARY KEY,
     platform_barcode TEXT,
     jky_goods_no TEXT NOT NULL,
+    is_fit INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -243,6 +244,24 @@ CREATE TABLE IF NOT EXISTS reconciliation_report (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_recon_report_date ON reconciliation_report(report_date);
+
+-- 🆕 Admin 用户表
+CREATE TABLE IF NOT EXISTS admin_users (
+    open_id TEXT PRIMARY KEY,
+    name TEXT DEFAULT '',
+    avatar TEXT DEFAULT '',
+    role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin', 'member')),
+    added_by TEXT DEFAULT '',
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 🆕 待审批用户表
+CREATE TABLE IF NOT EXISTS pending_admin_users (
+    open_id TEXT PRIMARY KEY,
+    name TEXT DEFAULT '',
+    avatar TEXT DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 
@@ -276,6 +295,10 @@ _MIGRATIONS = [
     "ALTER TABLE order_map ADD COLUMN last_alert_level TEXT DEFAULT ''",
     "ALTER TABLE order_map ADD COLUMN last_alert_time TEXT DEFAULT ''",
     "ALTER TABLE order_map ADD COLUMN last_alert_message TEXT DEFAULT ''",
+    # 🆕 admin: sessions 加 role 缓存列（减少每次 API 调用的 DB 开销）
+    "ALTER TABLE sessions ADD COLUMN role TEXT DEFAULT '',"
+    # 🆕 isFit: sku_mapping 组合装标志（2026-07-22）
+    "ALTER TABLE sku_mapping ADD COLUMN is_fit INTEGER DEFAULT 0",
 ]
 
 

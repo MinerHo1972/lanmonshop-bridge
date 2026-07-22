@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from ..clients.lanmonshop import LanmongClient
 from ..clients.jky import JkyClient
 from ..core.state_machine import transition as st_transition, STATE_INIT, STATE_AUDITED, \
-    STATE_JKY_CREATED, STATE_SKIPPED, STATE_CANCELLED, STATE_FAILED
+    STATE_JKY_CREATED, STATE_CANCELLED, STATE_FAILED
 from ..core.exception_handler import RetryState, classify_error, Severity
 from ..core.shared_unified import platform_to_unified, jky_to_unified, bridge_to_unified
 from ..notify.feishu import FeishuNotifier
@@ -157,8 +157,17 @@ async def run_cron_a(
             product_no = item.get("productNo", "")
             qty = item.get("num") or item.get("number") or 1
             if not product_no:
-                logger.warning(f"[cron-a] {order_no} 缺 productNo，跳过")
-                st_transition(map_id, STATE_SKIPPED, "cron_a", "缺 productNo")
+                msg = "缺 productNo"
+                logger.warning(f"[cron-a] {order_no} {msg}，跳过")
+                conn.execute(
+                    "UPDATE order_map SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (msg, map_id),
+                )
+                conn.commit()
+                if notifier:
+                    await notifier.alert_p1(
+                        "cron-a", f"订单 {order_no} {msg}", retry_count=0, order_map_id=map_id,
+                    )
                 skip_order = True
                 break
 
@@ -169,9 +178,13 @@ async def run_cron_a(
                 if not resolved:
                     msg = f"{product_no} 无sku映射（应补 sku_mapping 表）"
                     logger.warning(f"[cron-a] {order_no} {msg}")
-                    st_transition(map_id, STATE_SKIPPED, "cron_a", msg)
+                    conn.execute(
+                        "UPDATE order_map SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (msg, map_id),
+                    )
+                    conn.commit()
                     await notifier.alert_p1(
-                        order_no, msg,
+                        "cron-a", f"订单 {order_no} SKU缺映射: {msg}",
                         retry_count=0, order_map_id=map_id,
                     )
                     skip_order = True
@@ -184,26 +197,59 @@ async def run_cron_a(
                 (jky_goods_no,),
             ).fetchone()
             if not prod_row:
-                logger.warning(f"[cron-a] {order_no} {jky_goods_no} 不在缓存")
-                st_transition(map_id, STATE_SKIPPED, "cron_a", f"{jky_goods_no} 无缓存")
+                msg = f"{jky_goods_no} 无缓存（jky_product_cache 中不存在）"
+                logger.warning(f"[cron-a] {order_no} {msg}")
+                conn.execute(
+                    "UPDATE order_map SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (msg, map_id),
+                )
+                conn.commit()
+                if notifier:
+                    await notifier.alert_p1(
+                        "cron-a", f"订单 {order_no} {msg}", retry_count=0, order_map_id=map_id,
+                    )
                 skip_order = True
                 break
             cost_price = float(item.get("costPrice", 0) or 0)
             barcode = prod_row["jky_barcode"]
             if not barcode:
-                logger.warning(f"[cron-a] {order_no} {jky_goods_no} 条码为空，跳过")
-                st_transition(map_id, STATE_SKIPPED, "cron_a", f"{jky_goods_no} 条码为空")
-                skip_order = True
-                break
+                # 组合装商品允许空条码（isFit=1，直接走 goodsNo 匹配）
+                is_fit_row = conn.execute(
+                    "SELECT is_fit FROM sku_mapping WHERE platform_sku_no = ? OR jky_goods_no = ?",
+                    (jky_goods_no, jky_goods_no),
+                ).fetchone()
+                if is_fit_row and is_fit_row["is_fit"] == 1:
+                    logger.info(f"[cron-a] {order_no} {jky_goods_no} 组合装(跳过条码校验)")
+                else:
+                    msg = f"{jky_goods_no} 条码为空（jky_product_cache 中 barcode 为空）"
+                    logger.warning(f"[cron-a] {order_no} {msg}")
+                    conn.execute(
+                        "UPDATE order_map SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (msg, map_id),
+                    )
+                    conn.commit()
+                    if notifier:
+                        await notifier.alert_p1(
+                            "cron-a", f"订单 {order_no} {msg}", retry_count=0, order_map_id=map_id,
+                        )
+                    skip_order = True
+                    break
             sell_total = round(cost_price * qty, 2)
             order_total += sell_total
-            trade_order_details.append({
+            item_detail = {
                 "goodsNo": jky_goods_no,
-                "barcode": barcode,
+                "barcode": barcode or jky_goods_no,
                 "goodsName": prod_row["jky_goods_name"] or "",
                 "specName": "默认", "unit": "件",
                 "sellPrice": cost_price, "sellCount": qty, "sellTotal": sell_total,
-            })
+            }
+            is_fit_row = conn.execute(
+                "SELECT is_fit FROM sku_mapping WHERE platform_sku_no = ? OR jky_goods_no = ?",
+                (jky_goods_no, jky_goods_no),
+            ).fetchone()
+            if is_fit_row and is_fit_row["is_fit"] == 1:
+                item_detail["isFit"] = 1
+            trade_order_details.append(item_detail)
 
         if skip_order:
             continue
@@ -233,7 +279,7 @@ async def run_cron_a(
             if jky_code != 200:
                 logger.error(f"[cron-a] {order_no} 创单失败: {create_resp}")
                 if notifier:
-                    await notifier.alert_p1(order_no, f"JKY 创单失败: {create_resp.get('msg','')} (code={jky_code})", 0, map_id)
+                    await notifier.alert_p1("cron-a", f"订单 {order_no} JKY 创单失败: {create_resp.get('msg','')} (code={jky_code})", 0, map_id)
                 conn.execute(
                     "UPDATE order_map SET jky_state = NULL, jky_unified = NULL, bridge_unified = NULL WHERE id = ?",
                     (map_id,),
