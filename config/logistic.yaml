@@ -1,20 +1,28 @@
-# 物流映射 — 吉客云物流编码 → 中台物流编码
+# 物流映射 — JKY 物流中文名 → 蓝盟中台物流编码
 #
-# scope 3: 退化为「种子」文件 — 仅含少数常见快递的种子映射 + fallback。
-# 完整映射由 cron-e（scope 4）每日从 jky_logistic_cache 拉取后运营在 Admin 补齐。
-# LogisticResolver.resolve(jky_logistic_code) 先查 logistic_mapping，未命中走 fallback。
+# 格式：JKY_logisticName → {platform_code, platform_name}
+# platform_code = 蓝盟 syncOrderExpress 要求的 expressCode
+# platform_name = 蓝盟 syncOrderExpress 要求的 expressName
 #
-# 格式：jky_logistic_code → {platform_code, platform_name}
+# 来源：2026-07-07 用户提供蓝盟正式站物流编码表
+# 2026-08-06 补充别名（JKY 实际返回 logisticName 变体）：
+#   - "申通大件" → shentong（JKY 申通大件产品线，蓝盟无独立公司，归申通）
+#   - "中通"     → zhongtong（JKY 返回简称）
 
 logistic_mapping:
-  # 种子条目（运营确认后替换为真实中台编码）
-  "SF": { platform_code: "sf", platform_name: "顺丰速运" }
-  "ZTO": { platform_code: "zto", platform_name: "中通快递" }
-  "YTO": { platform_code: "yto", platform_name: "圆通速递" }
-  "STO": { platform_code: "sto", platform_name: "申通快递" }
-  "YT": { platform_code: "yt", platform_name: "韵达快递" }
-  "EMS": { platform_code: "ems", platform_name: "EMS" }
-  "JD": { platform_code: "jd", platform_name: "京东物流" }
+  "圆通速递": { platform_code: "yuantong", platform_name: "圆通速递" }
+  "中通快递": { platform_code: "zhongtong", platform_name: "中通快递" }
+  "中通":     { platform_code: "zhongtong", platform_name: "中通快递" }
+  "韵达快递": { platform_code: "yunda", platform_name: "韵达快递" }
+  "申通快递": { platform_code: "shentong", platform_name: "申通快递" }
+  "申通大件": { platform_code: "shentong", platform_name: "申通快递" }
+  "顺丰速运": { platform_code: "shunfeng", platform_name: "顺丰速运" }
+  "顺丰":     { platform_code: "shunfeng", platform_name: "顺丰速运" }
+  "邮政快递包裹": { platform_code: "youzhengguonei", platform_name: "邮政快递包裹" }
+  "极兔速递": { platform_code: "jtexpress", platform_name: "极兔速递" }
+  "京东物流": { platform_code: "jd", platform_name: "京东物流" }
+  "EMS":      { platform_code: "ems", platform_name: "EMS" }
+  "邮政电商标快": { platform_code: "youzhengdsbk", platform_name: "邮政电商标快" }
 
 # 兜底处理：未匹配的物流公司
 fallback:
