@@ -180,6 +180,7 @@ async def lifespan(app: FastAPI):
     app.state.jky_client = jky_client
     app.state.jky_direct = jky_direct
     app.state.notifier = notifier
+    app.state.logistic_resolver = logistic_resolver
 
     scheduler.start()
     logger.info(

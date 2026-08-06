@@ -37,7 +37,7 @@ def _clean_expired():
 
 
 async def get_current_user(request: Request) -> Optional[dict]:
-    """从 Cookie 中获取当前登录用户信息（DB 持久化）"""
+    """从 Cookie 中获取当前登录用户信息（DB 持久化，含 role 缓存）"""
     session_id = request.cookies.get(SESSION_COOKIE)
     if not session_id:
         return None
@@ -53,6 +53,7 @@ async def get_current_user(request: Request) -> Optional[dict]:
         "union_id": row["user_union_id"],
         "name": row["user_name"],
         "avatar": row["user_avatar"],
+        "role": row["role"] or "",  # P2 #7: role 直接从 session 缓存拿，不用额外查 admin_users
     }
 
 
@@ -61,6 +62,39 @@ async def require_api_auth(request: Request):
     user = await get_current_user(request)
     if not user:
         raise HTTPException(status_code=401, detail="unauthorized")
+    # 待审批用户（role=""）不可访问任何 API
+    if not user.get("role"):
+        raise HTTPException(status_code=403, detail="forbidden: pending approval")
+    return user
+
+
+async def require_admin(request: Request):
+    """Admin-only: 校验当前用户 role=admin
+
+    命中 session 缓存则零额外 DB 开销，miss 时查 admin_users 并回写缓存。
+    """
+    user = await require_api_auth(request)
+    if user.get("role") == "admin":
+        return user
+
+    # Fallback: 查 admin_users 表（session 缓存过期或旧 session 无 role 列）
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT role FROM admin_users WHERE open_id = ?",
+        (user["open_id"],),
+    ).fetchone()
+    if not row or row["role"] != "admin":
+        raise HTTPException(status_code=403, detail="forbidden: admin only")
+
+    # 回写 session 缓存
+    session_id = request.cookies.get(SESSION_COOKIE)
+    if session_id:
+        conn.execute(
+            "UPDATE sessions SET role = ? WHERE session_id = ?",
+            ("admin", session_id),
+        )
+        conn.commit()
+    user["role"] = "admin"
     return user
 
 
@@ -101,6 +135,36 @@ LOGIN_HTML = """<!DOCTYPE html>
   const params=new URLSearchParams(window.location.search);
   if(params.get('error'))document.getElementById('error-msg').style.display='block',document.getElementById('error-msg').textContent=params.get('error');
 </script>
+</body>
+</html>"""
+
+
+# ---------- 未授权页面 ----------
+
+NOT_AUTHORIZED_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bridge Admin - 等待审批</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0d1117;color:#c9d1d9;height:100vh;display:flex;align-items:center;justify-content:center}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:40px;text-align:center;max-width:420px;width:90%}
+  .icon{font-size:48px;margin-bottom:16px}
+  h1{color:#f0f6fc;font-size:20px;margin-bottom:8px}
+  p{color:#8b949e;font-size:13px;margin-bottom:24px;line-height:1.6}
+  .btn{display:inline-block;background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:10px 24px;border-radius:6px;font-size:13px;cursor:pointer;text-decoration:none}
+  .btn:hover{background:#30363d}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">⏳</div>
+  <h1>等待管理员审批</h1>
+  <p>你的飞书账号已提交审批申请。<br>请联系管理员在后台「用户管理」中批准你的账号后重新登录。</p>
+  <a class="btn" href="/admin/auth/logout">返回登录</a>
+</div>
 </body>
 </html>"""
 
@@ -177,28 +241,51 @@ async def auth_callback(code: str, request: Request):
 
     user_info = user_data.get("data", {})
 
-    # 3. 创建 session（DB）
+    # 3. 检查 admin 权限状态
     _clean_expired()
     session_id = secrets.token_hex(32)
     expires_at = datetime.now() + SESSION_TTL
     conn = get_connection()
+    open_id = user_info.get("open_id", "")
+    user_name = user_info.get("name", "")
+    user_avatar = user_info.get("avatar_url", "")
+
+    # 查 admin_users 表确认角色
+    admin_row = conn.execute(
+        "SELECT role FROM admin_users WHERE open_id = ?",
+        (open_id,),
+    ).fetchone()
+    role = admin_row["role"] if admin_row else ""
+
+    if not role:
+        # 未授权用户 → 加入待审批列表
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_admin_users (open_id, name, avatar) VALUES (?, ?, ?)",
+            (open_id, user_name, user_avatar),
+        )
+        conn.commit()
+        logger.info(f"[auth] 未授权用户 {user_name} ({open_id[:16]}...) 已加入待审批列表")
+
+    # 4. 创建 session（DB），带 role 缓存
     conn.execute(
-        "INSERT INTO sessions (session_id, user_open_id, user_union_id, user_name, user_avatar, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO sessions (session_id, user_open_id, user_union_id, user_name, user_avatar, expires_at, role) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             session_id,
-            user_info.get("open_id", ""),
+            open_id,
             user_info.get("union_id", ""),
-            user_info.get("name", ""),
-            user_info.get("avatar_url", ""),
+            user_name,
+            user_avatar,
             expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+            role,
         ),
     )
     conn.commit()
 
-    logger.info(f"[auth] 用户 {user_info.get('name')} 登录成功 (session={session_id[:8]}...)")
+    logger.info(f"[auth] 用户 {user_name} 登录成功 (session={session_id[:8]}..., role={role or 'pending'})")
 
-    # 4. 设置 cookie 并重定向
-    resp = RedirectResponse(url="/admin")
+    # 5. 设置 cookie 并重定向
+    redirect_to = "/admin" if role else "/admin/auth/pending"
+    resp = RedirectResponse(url=redirect_to)
     resp.set_cookie(
         key=SESSION_COOKIE,
         value=session_id,
@@ -211,7 +298,7 @@ async def auth_callback(code: str, request: Request):
     return resp
 
 
-@router.post("/logout")
+@router.get("/logout")
 async def logout(request: Request):
     """退出登录"""
     session_id = request.cookies.get(SESSION_COOKIE)
@@ -223,3 +310,9 @@ async def logout(request: Request):
     resp = RedirectResponse(url="/admin/auth/login")
     resp.delete_cookie(key=SESSION_COOKIE, path="/admin")
     return resp
+
+
+@router.get("/pending")
+async def pending_page(request: Request):
+    """等待审批页面"""
+    return HTMLResponse(NOT_AUTHORIZED_HTML)

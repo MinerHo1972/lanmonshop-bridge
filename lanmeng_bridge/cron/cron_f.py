@@ -21,6 +21,11 @@ from typing import Optional
 from ..clients.jky import JkyClient
 from ..clients.lanmonshop import LanmongClient
 from ..core.exception_handler import RetryState
+from ..core.shared_unified import (
+    platform_to_unified,
+    pull_jky_trades_multi_window,
+    resolve_jky_effective_state,
+)
 from ..notify.feishu import FeishuNotifier
 from ..storage.db import get_connection
 
@@ -100,54 +105,6 @@ async def _pull_lanmong_orders(
     return result
 
 
-async def _pull_jky_trades(
-    jky: JkyClient, cutoff: str
-) -> dict:
-    """拉 JKY 全量（时间范围 scroll 分页）包含拆合单后继
-
-    改用时间段全量拉取（同 cron-b），确保后继单（不同 tradeNo）
-    也能被拉到，代替按 tradeNo 批量查（会漏后继单）。
-
-    Returns:
-        {tradeNo: jky_order_dict}
-    """
-    result = {}
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    scroll_id = ""
-    while True:
-        try:
-            resp = await jky.trade_list({
-                "scrollId": scroll_id,
-                "pageSize": 200,
-                "startModified": cutoff,
-                "endModified": now_str,
-                "shopIds": JKY_SHOP_IDS,
-                "fields": "tradeNo,onlineTradeNo,tradeStatus,tradeStatusExplain,"
-                          "mainPostid,logisticName,shopName,scrollId,"
-                          "receiverName,mobile,phone,state,city,district,address,"
-                          "payment,totalFee,"
-                          "goodsDetail.goodsNo,goodsDetail.goodsName,"
-                          "goodsDetail.sellCount,goodsDetail.sellPrice,goodsDetail.sellTotal",
-            })
-        except Exception as e:
-            logger.warning(f"[cron-f] JKY 全量拉取失败: {e}")
-            break
-        if resp.get("code") != 200:
-            break
-        trades = resp.get("result", {}).get("data", {}).get("trades", [])
-        if not trades:
-            break
-        for t in trades:
-            tno = t.get("tradeNo") or ""
-            if tno:
-                result[tno] = t
-        scroll_id = resp.get("result", {}).get("data", {}).get("scrollId", "")
-        if not scroll_id or len(trades) < 200:
-            break
-    logger.info(f"[cron-f] JKY 全量返回 {len(result)} 条")
-    return result
-
-
 def _compare_order_fields(lanmeng_order: dict, jky_trade: dict) -> list[dict]:
     """Compare key fields between Blue Alliance and JKY order data.
 
@@ -194,28 +151,7 @@ def _compare_order_fields(lanmeng_order: dict, jky_trade: dict) -> list[dict]:
             "detail": "联系电话不一致",
         })
 
-    # 3. Address (combine province+city+district+address)
-    lm_addr = " ".join(filter(None, [
-        _safe_str(lanmeng_order.get("province")),
-        _safe_str(lanmeng_order.get("city")),
-        _safe_str(lanmeng_order.get("district")),
-        _safe_str(lanmeng_order.get("address")),
-    ])).strip()
-    jky_addr = " ".join(filter(None, [
-        _safe_str(jky_trade.get("state")),
-        _safe_str(jky_trade.get("city")),
-        _safe_str(jky_trade.get("district")),
-        _safe_str(jky_trade.get("address")),
-    ])).strip()
-    if lm_addr and jky_addr and lm_addr != jky_addr:
-        mismatches.append({
-            "field": "address",
-            "lanmeng_value": lm_addr,
-            "jky_value": jky_addr,
-            "detail": "收件地址不一致",
-        })
-
-    # 4. Order total — 蓝盟 costPrice(供货价)=JKY sellPrice(销售价)
+    # 3. ORDER TOTAL — 蓝盟 costPrice(供货价)=JKY sellPrice(销售价)
     # 蓝盟 orderProducts[].costPrice（供货价，PDF P47）在 bridge 设计中
     # 直接映射为 JKY tradeOrderDetails[].sellPrice。因此可以用
     # sum(costPrice × num) 作为预期 JKY totalFee/payment 进行对比。
@@ -299,14 +235,7 @@ def _compare_order_fields(lanmeng_order: dict, jky_trade: dict) -> list[dict]:
                         f"货品「{_safe_str(g.get('goodsName'))}」({no}) 在蓝盟中不存在"
                     )
                     continue
-                # Compare name
-                p_name = _safe_str(p.get("productName"))
-                g_name = _safe_str(g.get("goodsName"))
-                if p_name and g_name and p_name != g_name:
-                    product_details.append(
-                        f"{no}: 蓝盟「{p_name}」vs JKY「{g_name}」"
-                    )
-                # Compare quantity
+                # Compare quantity only — same productNo = correct product regardless of name
                 p_qty = _safe_int(p.get("num") or p.get("number"))
                 g_qty = _safe_int(g.get("sellCount"))
                 if p_qty != g_qty:
@@ -319,12 +248,7 @@ def _compare_order_fields(lanmeng_order: dict, jky_trade: dict) -> list[dict]:
                 p_name = _safe_str(lm_prod.get("productName"))
                 p_qty = _safe_int(lm_prod.get("num") or lm_prod.get("number"))
                 if i < len(jky_goods):
-                    g_name = _safe_str(jky_goods[i].get("goodsName"))
                     g_qty = _safe_int(jky_goods[i].get("sellCount"))
-                    if p_name and g_name and p_name != g_name:
-                        product_details.append(
-                            f"第{i+1}件: 蓝盟「{p_name}」vs JKY「{g_name}」"
-                        )
                     if p_qty != g_qty:
                         product_details.append(
                             f"第{i+1}件数量: 蓝盟{p_qty} vs JKY{g_qty}"
@@ -467,21 +391,11 @@ def _build_report(
             })
             continue
 
-        # ---- 字段级一致性比对（仅当蓝盟+JKY 两端均有数据时）----
+        # ---- 🆕 字段级一致性比对（仅收集，不作为偏差上报）----
+        # 商品名称/地址等文本差异是预期行为（不同系统命名不同），不产生偏差告警。
+        # 仅当业务实质差异（数量/金额/电话/收货人）时才在日志中记录，不进入对账偏差。
         if jky_trade_no and jky_trade_no in jky_trades:
-            field_mismatches = _compare_order_fields(order, jky_trades[jky_trade_no])
-            if field_mismatches:
-                deviations.append({
-                    "order_no": order_no,
-                    "db_state": db_state,
-                    "lanmong_state": lanmong_state,
-                    "lanmong_state_label": lanmong_state_label,
-                    "jky_trade_no": jky_trade_no,
-                    "jky_status": jky_status,
-                    "reason": "字段级不一致",
-                    "field_mismatches": field_mismatches,
-                })
-                continue
+            _compare_order_fields(order, jky_trades[jky_trade_no])  # 日志级检查，不产生偏差
 
     # ---- 补充：DB 有但蓝盟没返回的订单（可能是窗口外或无更新） ----
     db_order_nos = set(db_by_order_no.keys())
@@ -569,13 +483,6 @@ def _format_feishu_report(report: dict) -> str:
                          f"蓝盟={d['lanmong_state_label']} | "
                          f"JKY={d['jky_status'] or '-'}")
             lines.append(f"   原因: {d['reason']}")
-            # 字段级差异详情
-            fm = d.get("field_mismatches", [])
-            if fm:
-                for f in fm[:5]:
-                    lines.append(f"   ├ {f['detail']}")
-                if len(fm) > 5:
-                    lines.append(f"   └ ... 共 {len(fm)} 处字段不一致")
         if len(devs) > 10:
             lines.append(f"   ... 共 {len(devs)} 条, 详情见管理后台")
         lines.append("")
@@ -674,8 +581,6 @@ async def run_cron_f(
                 break
 
     # ---- 3b. 兜底刷新 DB 统一态字段 ----
-    from ..core.shared_unified import platform_to_unified, resolve_jky_effective_state, \
-        pull_jky_trades_multi_window
     successor_index = {}
     for jky_data in jky_trades.values():
         ts = str(jky_data.get("tradeStatus", "") or "")

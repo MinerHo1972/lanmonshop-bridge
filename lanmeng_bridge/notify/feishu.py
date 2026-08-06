@@ -40,19 +40,22 @@ class FeishuNotifier:
             text += "\n@all"
         await self._send(text)
 
-    async def alert_p1(self, order_no: str, last_error: str,
+    async def alert_p1(self, source: str, last_error: str,
                        retry_count: int, order_map_id: int):
         """P1 单订单卡住 — 30min 内处理"""
+        source_label = f"【{source}】" if source and source not in ("", "0") else ""
         text = (
-            f"⚠️ [P1 单订单卡住]\n"
-            f"单号: {order_no}\n"
+            f"⚠️ [P1 操作失败]{source_label}\n"
             f"失败原因: {last_error}\n"
-            f"已重试: {retry_count}/3\n"
-            f"订单: order_map.id={order_map_id}\n"
-            f"SQL: SELECT * FROM order_map WHERE id={order_map_id};\n"
-            f"状态日志: SELECT * FROM order_status_log WHERE "
-            f"order_map_id={order_map_id} ORDER BY ts DESC LIMIT 10;"
         )
+        if order_map_id and order_map_id > 0:
+            text += (
+                f"已重试: {retry_count}/3\n"
+                f"订单: order_map.id={order_map_id}\n"
+                f"SQL: SELECT * FROM order_map WHERE id={order_map_id};\n"
+                f"状态日志: SELECT * FROM order_status_log WHERE "
+                f"order_map_id={order_map_id} ORDER BY ts DESC LIMIT 10;"
+            )
         await self._send(text)
 
     async def alert_p2(self, error_type: str, detail: str,

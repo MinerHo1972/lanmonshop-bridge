@@ -285,7 +285,7 @@ async def run_cron_b(
                 conn.commit()
                 st_transition(map_id, STATE_FAILED, "cron_b", retry.last_error)
                 await notifier.alert_p1(
-                    row["platform_order_no"], retry.last_error or "回传失败",
+                    "cron-b", f"订单 {row['platform_order_no']} 回传失败: {retry.last_error or '回传失败'}",
                     retry.attempt, map_id,
                 )
 

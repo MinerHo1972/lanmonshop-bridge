@@ -13,7 +13,7 @@ db:
 
 # 蓝盟中台 API
 lanmong:
-  base_url: "https://test-zt-api.lanmonshop.com"
+  base_url: "https://zt-api.lanmonshop.com"
   # appKey/appSecret 从 credentials.yaml 读取
 
 # 吉客云 Gateway（hermes-web-api 代理路由）
