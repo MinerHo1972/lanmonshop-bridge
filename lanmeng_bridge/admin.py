@@ -1512,7 +1512,7 @@ async def _resubmit_create(row: dict, app_state) -> dict:
             logger.info(f"[resubmit] {platform_order_no} YX映射: {product_no} → {jky_goods_no}")
 
         prod_row = conn.execute(
-            "SELECT jky_barcode, jky_goods_name FROM jky_product_cache WHERE jky_goods_no = ?",
+            "SELECT jky_barcode, jky_goods_name, raw_json FROM jky_product_cache WHERE jky_goods_no = ?",
             (jky_goods_no,),
         ).fetchone()
         if not prod_row or not prod_row["jky_barcode"]:
@@ -1520,6 +1520,22 @@ async def _resubmit_create(row: dict, app_state) -> dict:
             return {"success": False, "action": "create",
                     "msg": f"货品 {jky_goods_no} 无缓存或条码为空，无法创单"}
         cost_price = float(item.get("costPrice", 0) or 0)
+        # 从 JKY 商品缓存 raw_json 取 unitName（如 "瓶"/"套"/"件"），缺失/异常 → fail-closed 拒绝
+        unit_name = None
+        try:
+            raw = prod_row["raw_json"] or ""
+            if raw:
+                raw_obj = json.loads(raw)
+                if isinstance(raw_obj, dict):
+                    un = raw_obj.get("unitName")
+                    if isinstance(un, str) and un.strip():
+                        unit_name = un.strip()
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError, ValueError):
+            unit_name = None
+        if not unit_name:
+            logger.warning(f"[resubmit] {platform_order_no} {jky_goods_no} 缓存缺 unitName，无法创单")
+            return {"success": False, "action": "create",
+                    "msg": f"货品 {jky_goods_no} 缓存缺 unitName，无法创单"}
         sell_total = round(cost_price * qty, 2)
         order_total = (order_total or 0) + sell_total
         trade_order_details.append({
@@ -1527,7 +1543,7 @@ async def _resubmit_create(row: dict, app_state) -> dict:
             "barcode": prod_row["jky_barcode"],
             "goodsName": prod_row["jky_goods_name"] or "",
             "specName": "默认",
-            "unit": "件",
+            "unit": unit_name,
             "sellPrice": cost_price,
             "sellCount": qty,
             "sellTotal": sell_total,

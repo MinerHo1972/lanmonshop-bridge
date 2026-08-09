@@ -193,7 +193,7 @@ async def run_cron_a(
                 logger.info(f"[cron-a] {order_no} YX映射: {product_no} → {jky_goods_no}")
 
             prod_row = conn.execute(
-                "SELECT jky_barcode, jky_goods_name FROM jky_product_cache WHERE jky_goods_no = ?",
+                "SELECT jky_barcode, jky_goods_name, raw_json FROM jky_product_cache WHERE jky_goods_no = ?",
                 (jky_goods_no,),
             ).fetchone()
             if not prod_row:
@@ -234,13 +234,39 @@ async def run_cron_a(
                         )
                     skip_order = True
                     break
+            # 从 JKY 商品缓存 raw_json 取 unitName（如 "瓶"/"套"/"件"），缺失/异常 → fail-closed 告警跳过
+            unit_name = None
+            try:
+                raw = prod_row["raw_json"] or ""
+                if raw:
+                    raw_obj = json.loads(raw)
+                    if isinstance(raw_obj, dict):
+                        un = raw_obj.get("unitName")
+                        if isinstance(un, str) and un.strip():
+                            unit_name = un.strip()
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError, ValueError):
+                unit_name = None
+            if not unit_name:
+                msg = f"{jky_goods_no} 缓存缺 unitName（jky_product_cache raw_json），无法创单"
+                logger.warning(f"[cron-a] {order_no} {msg}")
+                conn.execute(
+                    "UPDATE order_map SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (msg, map_id),
+                )
+                conn.commit()
+                if notifier:
+                    await notifier.alert_p1(
+                        "cron-a", f"订单 {order_no} {msg}", retry_count=0, order_map_id=map_id,
+                    )
+                skip_order = True
+                break
             sell_total = round(cost_price * qty, 2)
             order_total += sell_total
             item_detail = {
                 "goodsNo": jky_goods_no,
                 "barcode": barcode or jky_goods_no,
                 "goodsName": prod_row["jky_goods_name"] or "",
-                "specName": "默认", "unit": "件",
+                "specName": "默认", "unit": unit_name,
                 "sellPrice": cost_price, "sellCount": qty, "sellTotal": sell_total,
             }
             is_fit_row = conn.execute(
