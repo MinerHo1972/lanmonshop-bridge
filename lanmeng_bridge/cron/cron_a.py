@@ -260,13 +260,26 @@ async def run_cron_a(
                     )
                 skip_order = True
                 break
+            # 从 JKY 商品缓存 raw_json 取规格名 skuName（如 "1瓶装"/"50颗装"），缺失/异常 → 回退 "默认"
+            # （JKY 对 specName 宽松不校验：1377 商品无一 "默认" 但历史推单全成功；unit 才严格校验）
+            spec_name = "默认"
+            try:
+                raw = prod_row["raw_json"] or ""
+                if raw:
+                    raw_obj = json.loads(raw)
+                    if isinstance(raw_obj, dict):
+                        sn = raw_obj.get("skuName")
+                        if isinstance(sn, str) and sn.strip():
+                            spec_name = sn.strip()
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError, ValueError):
+                spec_name = "默认"
             sell_total = round(cost_price * qty, 2)
             order_total += sell_total
             item_detail = {
                 "goodsNo": jky_goods_no,
                 "barcode": barcode or jky_goods_no,
                 "goodsName": prod_row["jky_goods_name"] or "",
-                "specName": "默认", "unit": unit_name,
+                "specName": spec_name, "unit": unit_name,
                 "sellPrice": cost_price, "sellCount": qty, "sellTotal": sell_total,
             }
             is_fit_row = conn.execute(
