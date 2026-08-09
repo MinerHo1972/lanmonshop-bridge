@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from ..clients.lanmonshop import LanmongClient
 from ..clients.jky import JkyClient
-from ..core.state_machine import transition as st_transition, STATE_JKY_SHIPPED, STATE_SYNCED, \
+from ..core.state_machine import transition as st_transition, is_terminal, STATE_JKY_SHIPPED, STATE_SYNCED, \
     STATE_DONE, STATE_FAILED
 from ..core.logistic_resolver import LogisticResolver
 from ..core.exception_handler import RetryState, classify_error, Severity
@@ -156,11 +156,30 @@ async def run_cron_b(
         # JKY 在 "待发货" 阶段（4112）也可能有预约物流单号（mainPostid），
         # 但不等同于已发货。只能用 tradeStatus 判断，不能只看 postid。
         JKY_SHIPPED_UNIFIED = {"已发货", "已完成"}
-        if effective_jky_unified in JKY_SHIPPED_UNIFIED and postid and row["state"] not in (STATE_DONE, STATE_SYNCED):
-            # JKY 已发货 + 有物流单号 + 未闭环 → 回传蓝盟
-            current_state = row["state"]
-            if current_state in ("jky_created", "failed"):
-                st_transition(map_id, STATE_JKY_SHIPPED, "cron_b")
+        # 终态（done/jky_cancelled/cancelled）不再回传——cron-c 已取消的订单跳过（2026-08-09 修复）
+        if effective_jky_unified in JKY_SHIPPED_UNIFIED and postid \
+                and row["state"] not in (STATE_DONE, STATE_SYNCED) \
+                and not is_terminal(row["state"]):
+            # JKY 已发货 + 有物流单号 + 未闭环 + 非终态 → 回传蓝盟
+            # H2: 副作用前重读 DB 当前状态，防 cron-b/cron-c 并发竞态（快照可能已过期）
+            current_row = conn.execute(
+                "SELECT state FROM order_map WHERE id = ?", (map_id,)
+            ).fetchone()
+            if not current_row or is_terminal(current_row["state"]) \
+                    or current_row["state"] == STATE_SYNCED:
+                logger.info(f"[cron-b] {row['platform_order_no']} 状态已变终态/已闭环，跳过回传")
+                continue
+            current_state = current_row["state"]
+            # M1: 状态白名单——jky_shipped 可直接回传；audited/jky_created/failed 先转移成功后回传；
+            # init/skipped/未知状态跳过（避免非法状态下调用外部接口）
+            if current_state not in ("jky_shipped", "audited", "jky_created", "failed"):
+                logger.warning(f"[cron-b] {row['platform_order_no']} 状态 {current_state} 不应回传，跳过")
+                continue
+            if current_state in ("audited", "jky_created", "failed"):
+                # M2: 检查转移返回值——转移失败则不得继续调用外部接口
+                if not st_transition(map_id, STATE_JKY_SHIPPED, "cron_b"):
+                    logger.warning(f"[cron-b] {row['platform_order_no']} 状态转移 {current_state}→jky_shipped 失败，跳过回传")
+                    continue
 
             logistic_entry = logistic_resolver.resolve(logist_name)
             platform_code = logistic_entry.get("platform_code", "")
@@ -283,10 +302,60 @@ async def run_cron_b(
                     (retry.attempt, retry.last_error, map_id),
                 )
                 conn.commit()
-                st_transition(map_id, STATE_FAILED, "cron_b", retry.last_error)
-                await notifier.alert_p1(
-                    "cron-b", f"订单 {row['platform_order_no']} 回传失败: {retry.last_error or '回传失败'}",
-                    retry.attempt, map_id,
-                )
+                # H1 修正版：回传失败后查蓝盟实际态——若蓝盟已取消，则这是预期行为
+                # （订单已取消，物流回传必然失败），不升 P1；但绝不写 jky_cancelled 终态，
+                # JKY 取消仍由 cron-c 正规执行。查不到可靠证据则维持原 P1（fail-closed）。
+                lanm_cancelled = False
+                try:
+                    lanm_resp = await lanmong.get_deliver_orders(
+                        order_no=row["platform_order_no"],
+                        page_size=5,
+                        state=None,
+                    )
+                    if lanm_resp.get("code") == 0:
+                        lanm_data = lanm_resp.get("data", {})
+                        order_list = (
+                            lanm_data.get("orderList", [])
+                            if isinstance(lanm_data, dict)
+                            else (lanm_data if isinstance(lanm_data, list) else [])
+                        )
+                        # M1 fail-closed: 精确匹配 orderNo + 严格映射为已取消/退款才抑制
+                        for o in order_list:
+                            if str(o.get("orderNo", "")) == str(row["platform_order_no"]):
+                                actual_state = o.get("state")
+                                if actual_state is not None and platform_to_unified(actual_state) == "已取消/退款":
+                                    lanm_cancelled = True
+                                    new_unified = platform_to_unified(actual_state)
+                                    conn.execute(
+                                        "UPDATE order_map SET platform_state = ?, platform_unified = ?, "
+                                        "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                                        (actual_state, new_unified, map_id),
+                                    )
+                                    conn.commit()
+                                    logger.warning(
+                                        f"[cron-b] {row['platform_order_no']} 蓝盟已取消(state={actual_state})，"
+                                        f"物流回传失败属预期，不升 P1；JKY 取消交由 cron-c 处理"
+                                    )
+                                break
+                except Exception as e:
+                    # M1: 查询失败不能抑制 P1（fail-closed）
+                    logger.warning(f"[cron-b] {row['platform_order_no']} 蓝盟实际态复核失败（维持 P1）: {e}")
+                if not lanm_cancelled:
+                    # M2 补充：发 P1 前重读 DB——若已被 cron-c 转终态（jky_cancelled/cancelled），
+                    # 视为可靠证据抑制 P1（避免机械告警），订单已由 cron-c 处理
+                    final_row = conn.execute(
+                        "SELECT state FROM order_map WHERE id = ?", (map_id,)
+                    ).fetchone()
+                    if final_row and is_terminal(final_row["state"]):
+                        logger.warning(
+                            f"[cron-b] {row['platform_order_no']} 发 P1 前重读为终态 {final_row['state']}，"
+                            f"抑制 P1（cron-c 已处理）"
+                        )
+                    else:
+                        st_transition(map_id, STATE_FAILED, "cron_b", retry.last_error)
+                        await notifier.alert_p1(
+                            "cron-b", f"订单 {row['platform_order_no']} 回传失败: {retry.last_error or '回传失败'}",
+                            retry.attempt, map_id,
+                        )
 
     logger.info(f"[cron-b] 完成 (刷新 {updated_count} 条)")
