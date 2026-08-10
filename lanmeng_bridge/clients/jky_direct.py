@@ -4,7 +4,6 @@ import hashlib
 import json
 import logging
 from datetime import datetime
-from typing import Optional
 
 import httpx
 
@@ -130,6 +129,14 @@ class JkyDirectClient:
     async def goods_search(self, biz: dict) -> dict:
         """搜索货品（erp-goods.goods.sku.search）"""
         return await self._call("erp-goods.goods.sku.search", biz)
+
+    async def stockquantity_get(self, biz: dict) -> dict:
+        """库存查询（erp.stockquantity.get）— cache-miss 点查补档案用
+
+        返回 result.data.goodsStockQuantity[]（含 goodsNo/goodsName/unitName/skuBarcode）。
+        ⚠️ 不含零库存货品：data 空 = 零库存或编码不存在，调用方须 halt + P1。
+        """
+        return await self._call("erp.stockquantity.get", biz)
 
     # ---------- 物流 ----------
 

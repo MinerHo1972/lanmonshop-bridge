@@ -678,7 +678,8 @@ async def main() -> int:
 
     # --- step 3
     try:
-        await cron_a.run_cron_a(lanmong, jky, sku_resolver, notifier, auto_review=True)
+        # (2026-08-10) 修正过时 positional 参数：sku_resolver 已不在 run_cron_a 签名中
+        await cron_a.run_cron_a(lanmong, jky, notifier, auto_review=True)
         ok = await step3_audit_lanmong(transport)
         if ok:
             record(3, "中台订单 state=2 (已自动过审)", "PASS",

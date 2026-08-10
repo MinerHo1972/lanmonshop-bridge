@@ -82,7 +82,7 @@ def transition(
     """
     conn = get_connection()
 
-    # 读当前状态
+    # 读当前状态（用于审计日志 + 合法性判断）
     row = conn.execute(
         "SELECT state FROM order_map WHERE id = ?", (order_map_id,)
     ).fetchone()
@@ -94,16 +94,23 @@ def transition(
     if not can_transition(from_state, to_state):
         return False
 
-    # 原子更新 + 审计
-    conn.execute(
+    # H-2 (2026-08-10): 条件原子更新 —— WHERE 带原状态，rowcount==1 才算成功。
+    # 防多进程/多实例并发：两个执行者同时读到 init，只有一个能成功转移，
+    # 另一个 rowcount=0 返回 False（调用方据此跳过，防重复创单）。
+    cur = conn.execute(
         """UPDATE order_map SET
             state = ?,
             last_attempt_at = CURRENT_TIMESTAMP,
             last_error = ?,
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?""",
-        (to_state, error, order_map_id),
+        WHERE id = ? AND state = ?""",
+        (to_state, error, order_map_id, from_state),
     )
+    if cur.rowcount != 1:
+        conn.rollback()
+        return False
+
+    # 审计日志（仅在转移成功后写入）
     conn.execute(
         """INSERT INTO order_status_log
             (order_map_id, from_state, to_state, source, error)

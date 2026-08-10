@@ -50,11 +50,12 @@ notifier: FeishuNotifier = None
 # ---------- Cron 任务 ----------
 
 async def _run_cron_a():
-    global lanmong_client, jky_client, notifier
+    global lanmong_client, jky_client, jky_direct, notifier
     try:
         await cron_a.run_cron_a(
             lanmong_client, jky_client, notifier,
             auto_review=settings.get("auto_review", True),
+            jky_direct=jky_direct,
         )
     except Exception as e:
         logger.exception(f"[cron-a] 未捕获异常: {e}")
