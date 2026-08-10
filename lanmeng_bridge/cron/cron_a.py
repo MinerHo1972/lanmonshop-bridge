@@ -247,19 +247,28 @@ async def run_cron_a(
             except (json.JSONDecodeError, TypeError, UnicodeDecodeError, ValueError):
                 unit_name = None
             if not unit_name:
-                msg = f"{jky_goods_no} 缓存缺 unitName（jky_product_cache raw_json），无法创单"
-                logger.warning(f"[cron-a] {order_no} {msg}")
-                conn.execute(
-                    "UPDATE order_map SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (msg, map_id),
-                )
-                conn.commit()
-                if notifier:
-                    await notifier.alert_p1(
-                        "cron-a", f"订单 {order_no} {msg}", retry_count=0, order_map_id=map_id,
+                # 组合装 (is_fit=1) 在 JKY 商品表无档案，raw_json 必空 → unit 兜底 "套"（与现有组合装 180202408090302785 一致）
+                is_fit_row = conn.execute(
+                    "SELECT is_fit FROM sku_mapping WHERE platform_sku_no = ? OR jky_goods_no = ?",
+                    (jky_goods_no, jky_goods_no),
+                ).fetchone()
+                if is_fit_row and is_fit_row["is_fit"] == 1:
+                    unit_name = "套"
+                    logger.info(f"[cron-a] {order_no} {jky_goods_no} 组合装(unit 兜底'套')")
+                else:
+                    msg = f"{jky_goods_no} 缓存缺 unitName（jky_product_cache raw_json），无法创单"
+                    logger.warning(f"[cron-a] {order_no} {msg}")
+                    conn.execute(
+                        "UPDATE order_map SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (msg, map_id),
                     )
-                skip_order = True
-                break
+                    conn.commit()
+                    if notifier:
+                        await notifier.alert_p1(
+                            "cron-a", f"订单 {order_no} {msg}", retry_count=0, order_map_id=map_id,
+                        )
+                    skip_order = True
+                    break
             # 从 JKY 商品缓存 raw_json 取规格名 skuName（如 "1瓶装"/"50颗装"），缺失/异常 → 回退 "默认"
             # （JKY 对 specName 宽松不校验：1377 商品无一 "默认" 但历史推单全成功；unit 才严格校验）
             spec_name = "默认"
