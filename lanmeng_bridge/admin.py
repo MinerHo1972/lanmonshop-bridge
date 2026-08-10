@@ -955,11 +955,15 @@ async def api_reconciliation(request: Request, page: int = 1, page_size: int = 5
             # 统一态字段
             "platform_unified": r["platform_unified"] or _lanmong_label(r["platform_state"]),
             "bridge_unified": r["bridge_unified"] or _bridge_label(r["state"]),
-            "jky_unified": r["jky_effective_unified"] or r["jky_unified"] or "待发货",
+            # jky_unified 空值 fallback: 未创单(无 jky_trade_no) → "未创建"，不能用 "待发货" 兜底
+            # (2026-08-10 修复: 原 `or "待发货"` 让 failed/init 订单 JKY 列显示假"待发货"，误导三端一致性判断)
+            "jky_unified": r["jky_effective_unified"] or r["jky_unified"]
+            or _jky_label(r["state"], r["jky_trade_no"], r["logistic_no"]),
             "consistent": (
                 (r["platform_unified"] or _lanmong_label(r["platform_state"]))
                 == (r["bridge_unified"] or _bridge_label(r["state"]))
-                == (r["jky_effective_unified"] or r["jky_unified"] or "待发货")
+                == (r["jky_effective_unified"] or r["jky_unified"]
+                    or _jky_label(r["state"], r["jky_trade_no"], r["logistic_no"]))
             ),
         }
         orders.append(entry)
