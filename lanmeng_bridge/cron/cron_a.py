@@ -28,6 +28,45 @@ _resolver = SkuResolver()
 CURSOR_KEY = "cron_a_last_pull"
 LOOKBACK_DAYS = 15
 
+# 点查补档唯一性校验的常量
+_PAGE_SIZE = 20      # erp.stockquantity.get 单页上限（生产实测 12 仓商品 12 条，20 足够）
+_MAX_PAGES = 10      # 防呆上限：超过 10 页视为异常，fail-closed
+
+
+def _resolve_archive(stock_records: list, target_no: str):
+    """校验点查结果并解析唯一档案（生产代码与单测共用，2026-08-10 抽取）。
+
+    语义（生产实测修正，替代"恰好 1 条"）：
+    - 多仓商品不带 warehouseCode 返回多条记录是常态（如 1802026052010 在 4 仓、
+      1802025032701 在 12 仓），不能要求恰好 1 条；
+    - 但跨仓档案（goodsName/skuBarcode/unitName）必须一致，不一致 = 无法确定性补档 → halt；
+    - 原始响应含任意非 dict 元素 = 结构非法 → halt（M-3，不得过滤后误判唯一）。
+
+    返回: (ok, rec, msg)
+      ok=True  → rec = 唯一档案记录（取第一条）
+      ok=False → rec=None, msg=失败原因（已含 halt 用文案）
+    """
+    raw_count = len(stock_records)
+    malformed = [r for r in stock_records if not isinstance(r, dict)]
+    if malformed:
+        return False, None, (f"点查响应含 {len(malformed)} 条畸形记录"
+                             f"（共 {raw_count} 条），结构非法，需人工补录")
+    matched = [
+        r for r in stock_records
+        if str((r or {}).get("goodsNo") or "").strip() == target_no
+    ]
+    if not matched:
+        return False, None, (f"点查候选 {raw_count} 条但无匹配（目标 {target_no}），"
+                             f"无法补档案，需人工补录")
+    name_set = {str(r.get("goodsName") or "").strip() for r in matched}
+    barcode_set = {str(r.get("skuBarcode") or "").strip() for r in matched}
+    unit_set = {str(r.get("unitName") or "").strip() for r in matched}
+    if len(name_set) > 1 or len(barcode_set) > 1 or len(unit_set) > 1:
+        return False, None, (f"跨仓档案不一致"
+                             f"(name={len(name_set)} barcode={len(barcode_set)} "
+                             f"unit={len(unit_set)} 变体，共 {len(matched)} 条)，需人工补录")
+    return True, matched[0], ""
+
 
 async def run_cron_a(
     lanmong: LanmongClient,
@@ -248,7 +287,7 @@ async def run_cron_a(
                     skip_order = True
                     break
 
-                # 基础商品：点查 erp.stockquantity.get 补档案（固定创单仓 02 + 唯一匹配校验）
+                # 基础商品：点查 erp.stockquantity.get 补档案（不传仓库条件，分页拉全 + 跨仓档案一致性校验）
                 # H-1: 直连 JkyDirectClient（进程内），不走 HTTP 路由 —— 无公网暴露面
                 if jky_direct is None:
                     msg = f"{jky_goods_no} jky_direct 客户端未注入，无法点查补档案，需人工补录"
@@ -271,12 +310,38 @@ async def run_cron_a(
                 while True:
                     attempt += 1
                     try:
-                        stock_resp = await jky_direct.stockquantity_get({
-                            "goodsNo": str(jky_goods_no),
-                            "warehouseCode": "02",
-                            "pageIndex": 0,
-                            "pageSize": 5,
-                        })
+                        # H-1 (2026-08-10 Codex 第五轮): 分页拉全 —— 多仓商品记录可能超过单页,
+                        # 只查第一页会导致跨仓冲突漏检。循环 pageIndex 直到空页或达防呆上限。
+                        stock_records = []
+                        page_index = 0
+                        while True:
+                            stock_resp = await jky_direct.stockquantity_get({
+                                "goodsNo": str(jky_goods_no),
+                                # 2026-08-10 生产实测: 不传 warehouseCode —— 02=电商仓仅成品,
+                                # 半品原料在 16/22 工厂仓, 写死单仓会漏类导致点查恒空
+                                "pageIndex": page_index,
+                                "pageSize": _PAGE_SIZE,
+                            })
+                            if stock_resp.get("code") != 200:
+                                break
+                            result_wrapper = stock_resp.get("result") or {}
+                            data = result_wrapper.get("data") or {}
+                            if isinstance(data, dict):
+                                records = data.get("goodsStockQuantity") or []
+                            elif isinstance(data, list):
+                                records = data
+                            else:
+                                records = []
+                            if not isinstance(records, list):
+                                records = []
+                            stock_records.extend(records)
+                            if len(records) < _PAGE_SIZE:
+                                break  # 已拉全（最后一页不满）
+                            page_index += 1
+                            if page_index >= _MAX_PAGES:
+                                # 防呆: 连续满页超过上限 = 异常数据形态，fail-closed
+                                records = []
+                                break
                         if stock_resp.get("code") != 200:
                             msg = (f"{jky_goods_no} 点查失败 code={stock_resp.get('code')} "
                                    f"msg={stock_resp.get('msg','')}（不重试，需人工补录）")
@@ -292,18 +357,22 @@ async def run_cron_a(
                                 )
                             skip_order = True
                             break
-                        result_wrapper = stock_resp.get("result") or {}
-                        data = result_wrapper.get("data") or {}
-                        if isinstance(data, dict):
-                            records = data.get("goodsStockQuantity") or []
-                        elif isinstance(data, list):
-                            records = data
-                        else:
-                            records = []
-                        if not isinstance(records, list):
-                            records = []
-                        stock_records = records
-                        break  # HTTP + code=200 层成功
+                        if page_index >= _MAX_PAGES:
+                            msg = (f"{jky_goods_no} 点查记录达到 {_MAX_PAGES * _PAGE_SIZE} 条上限"
+                                   f"（连续 {_MAX_PAGES} 页满页），数据形态异常，需人工补录")
+                            logger.warning(f"[cron-a] {order_no} {msg}")
+                            conn.execute(
+                                "UPDATE order_map SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                                (msg, map_id),
+                            )
+                            conn.commit()
+                            if notifier:
+                                await notifier.alert_p1(
+                                    "cron-a", f"订单 {order_no} {msg}", retry_count=0, order_map_id=map_id,
+                                )
+                            skip_order = True
+                            break
+                        break  # HTTP + code=200 层成功，分页拉全
                     except httpx.HTTPStatusError as e:
                         status = e.response.status_code if e.response is not None else 0
                         retryable = status in (408, 429) or status >= 500
@@ -356,15 +425,13 @@ async def run_cron_a(
                 if skip_order:
                     break
 
-                # 唯一匹配校验：恰好 1 条且 goodsNo 精确等于目标，否则 halt 不写缓存
+                # 唯一性校验: 生产代码与单测共用 _resolve_archive (2026-08-10 抽取, M-1)。
+                # 语义: matched ≥ 1 + 跨仓档案一致性 —— 多仓商品返回多条是常态,
+                # 但 goodsName/skuBarcode/unitName 跨仓不一致 = 无法确定性补档 → halt。
                 target_no = str(jky_goods_no).strip()
-                # M-3 (2026-08-10 Codex 第三轮): 原始响应含任意非 dict 元素 = 结构非法，
-                # 必须 halt（不能过滤后误判唯一）。唯一性基于原始候选而非过滤后列表。
-                raw_count = len(stock_records)
-                malformed = [r for r in stock_records if not isinstance(r, dict)]
-                if malformed:
-                    msg = (f"{jky_goods_no} 点查响应含 {len(malformed)} 条畸形记录"
-                           f"（共 {raw_count} 条），结构非法，需人工补录")
+                ok, rec, arch_msg = _resolve_archive(stock_records, target_no)
+                if not ok:
+                    msg = f"{jky_goods_no} {arch_msg}"
                     logger.warning(f"[cron-a] {order_no} {msg}")
                     conn.execute(
                         "UPDATE order_map SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -377,26 +444,6 @@ async def run_cron_a(
                         )
                     skip_order = True
                     break
-                matched = [
-                    r for r in stock_records
-                    if str((r or {}).get("goodsNo") or "").strip() == target_no
-                ]
-                if len(stock_records) != 1 or len(matched) != 1:
-                    msg = (f"{jky_goods_no} 点查候选 {len(stock_records)} 条（匹配 {len(matched)} 条），"
-                           f"无法确定性补档案，需人工补录")
-                    logger.warning(f"[cron-a] {order_no} {msg}")
-                    conn.execute(
-                        "UPDATE order_map SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                        (msg, map_id),
-                    )
-                    conn.commit()
-                    if notifier:
-                        await notifier.alert_p1(
-                            "cron-a", f"订单 {order_no} {msg}", retry_count=0, order_map_id=map_id,
-                        )
-                    skip_order = True
-                    break
-                rec = matched[0]
                 goods_name = str(rec.get("goodsName") or "").strip()
                 sku_barcode = str(rec.get("skuBarcode") or "").strip()
                 raw_unit = rec.get("unitName")

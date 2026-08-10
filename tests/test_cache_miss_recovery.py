@@ -92,6 +92,24 @@ class MockJky:
             return {"code": 200, "result": {"data": {"goodsStockQuantity": [{
                 "goodsNo": biz["goodsNo"], "goodsName": "测试", "skuBarcode": "X"
             }]}}}
+        if self.mode == "multi_wh":
+            # 多仓商品: 多条记录但档案一致（2026-08-10 生产实测: 1802026052010 在 4 仓）
+            return {"code": 200, "result": {"data": {"goodsStockQuantity": [
+                {"goodsNo": biz["goodsNo"], "goodsName": "多仓咖啡", "skuBarcode": "6973694373160",
+                 "unitName": "盒", "warehouseCode": "02"},
+                {"goodsNo": biz["goodsNo"], "goodsName": "多仓咖啡", "skuBarcode": "6973694373160",
+                 "unitName": "盒", "warehouseCode": "16"},
+                {"goodsNo": biz["goodsNo"], "goodsName": "多仓咖啡", "skuBarcode": "6973694373160",
+                 "unitName": "盒", "warehouseCode": "22"},
+            ]}}}
+        if self.mode == "conflict":
+            # 跨仓档案不一致: unitName 不同 → 必须 halt（无法确定性补档）
+            return {"code": 200, "result": {"data": {"goodsStockQuantity": [
+                {"goodsNo": biz["goodsNo"], "goodsName": "冲突商品", "skuBarcode": "6973694373160",
+                 "unitName": "盒", "warehouseCode": "02"},
+                {"goodsNo": biz["goodsNo"], "goodsName": "冲突商品", "skuBarcode": "6973694373160",
+                 "unitName": "袋", "warehouseCode": "16"},
+            ]}}}
         if self.mode == "retry_once":
             self.calls.append("RETRY")
             if len(self.calls) == 1:
@@ -129,7 +147,7 @@ async def run_case(mode, jky_goods_no="1802025032701", code_len=None):
 
     # 用真实函数测 —— 但 run_cron_a 需要 lanmong mock，这里直接手动触发核心：
     # 简化：直接测试 stockquantity_get + 校验逻辑的等价路径
-    biz = {"goodsNo": jky_goods_no, "warehouseCode": "02", "pageIndex": 0, "pageSize": 5}
+    biz = {"goodsNo": jky_goods_no, "pageIndex": 0, "pageSize": 5}
     try:
         resp = await jky.stockquantity_get(biz)
         if mode == "fail3":
@@ -140,13 +158,18 @@ async def run_case(mode, jky_goods_no="1802025032701", code_len=None):
         records = data.get("goodsStockQuantity") or [] if isinstance(data, dict) else []
         if not isinstance(records, list):
             records = []
-        # M-3: 原始响应含非 dict 元素 = 结构非法，直接 halt（不得过滤后误判唯一）
-        if any(not isinstance(r, dict) for r in records):
-            return {"result": "HALT_MALFORMED", "raw_count": len(records)}
-        matched = [r for r in records if str(r.get("goodsNo") or "").strip() == jky_goods_no]
-        if len(records) != 1 or len(matched) != 1:
-            return {"result": "HALT_NOT_UNIQUE", "records": len(records), "matched": len(matched)}
-        rec = matched[0]
+        # M-1 (2026-08-10 Codex 第五轮): 测试调用真实 _resolve_archive，
+        # 不再内联复制校验逻辑 —— 消除"测试副本与生产代码脱钩"
+        ok, rec, arch_msg = ca._resolve_archive(records, jky_goods_no)
+        if not ok:
+            # 从错误消息区分 halt 类型
+            if "畸形记录" in arch_msg:
+                return {"result": "HALT_MALFORMED", "raw_count": len(records)}
+            if "无匹配" in arch_msg:
+                return {"result": "HALT_NOT_UNIQUE", "records": len(records), "matched": 0}
+            if "不一致" in arch_msg:
+                return {"result": "HALT_ARCHIVE_CONFLICT", "msg": arch_msg}
+            return {"result": "HALT_ARCHIVE", "msg": arch_msg}
         goods_name = str(rec.get("goodsName") or "").strip()
         sku_barcode = str(rec.get("skuBarcode") or "").strip()
         raw_unit = rec.get("unitName")
@@ -190,11 +213,17 @@ async def main():
     # 5. 缺 unitName → 不写缓存
     r = await run_case("no_unit")
     cases.append(("缺unitName→halt不写缓存", r["result"] == "HALT_MISSING_FIELD", r))
+    # 5b. 多仓商品档案一致 → 成功补档（2026-08-10 修复: matched≥1 不再要求恰好1条）
+    r = await run_case("multi_wh")
+    cases.append(("多仓档案一致→成功", r["result"] == "SUCCESS_WRITTEN", r))
+    # 5c. 跨仓档案冲突 → halt（fail-closed 保留）
+    r = await run_case("conflict")
+    cases.append(("跨仓档案冲突→halt", r["result"] == "HALT_ARCHIVE_CONFLICT", r))
 
     # 6-7. 重试语义
     jky = MockJky(); jky.mode = "retry_once"
     n = MockNotifier()
-    biz = {"goodsNo": "1802025032701", "warehouseCode": "02", "pageIndex": 0, "pageSize": 5}
+    biz = {"goodsNo": "1802025032701", "pageIndex": 0, "pageSize": 5}
     calls = 0
     for attempt in range(1, 4):
         try:
