@@ -681,4 +681,31 @@ async def run_cron_f(
     # ---- 6. 推飞书 ----
     msg = _format_feishu_report(report)
     await notifier._send(msg)
+
+    # ---- 7. api_call_log retention 清理（保留 api_log_retention_days 天，默认 14，2026-08-15）----
+    # 根因: fullinfoget/trade.list 响应全文入库 ~100KB/行，无清理时月增 3G+（生产实测 3.4G）
+    try:
+        from ..config import load_settings
+        retention_days = int(load_settings().get("api_log_retention_days", 14))
+    except Exception:
+        retention_days = 14
+    try:
+        log_cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H:%M:%S")
+        cur = conn.execute(
+            "DELETE FROM api_call_log WHERE created_at < ?", (log_cutoff,),
+        )
+        conn.commit()
+        deleted = cur.rowcount
+        if deleted:
+            logger.info(f"[cron-f] api_call_log 清理 {deleted} 条（<{log_cutoff}，保留 {retention_days} 天）")
+            # 碎片回收：小于阈值时在线 incremental_vacuum，避免锁写
+            try:
+                conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+                conn.execute("PRAGMA incremental_vacuum(512)")
+                logger.info("[cron-f] incremental_vacuum(512) 完成")
+            except Exception as ve:
+                logger.warning(f"[cron-f] incremental_vacuum 失败（不影响业务）: {ve}")
+    except Exception as e:
+        logger.warning(f"[cron-f] api_call_log 清理失败（不影响对账）: {e}")
+
     logger.info(f"[cron-f] run_id={run_id} 完成")

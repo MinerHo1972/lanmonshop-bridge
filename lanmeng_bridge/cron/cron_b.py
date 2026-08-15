@@ -212,6 +212,61 @@ async def run_cron_b(
             except (json.JSONDecodeError, ValueError, TypeError):
                 pass
 
+            # 回退：order_items_json 无有效明细时，按单号实时回查蓝盟补明细
+            # （根因：建单快照天生缺 orderProducts，重试无解；回查是唯一可靠数据源）
+            if not items:
+                fallback_products = []
+                try:
+                    fb_resp = await lanmong.get_deliver_orders(
+                        order_no=row["platform_order_no"],
+                        page_size=5,
+                        state=None,
+                    )
+                    if fb_resp.get("code") == 0:
+                        fb_data = fb_resp.get("data", {})
+                        fb_list = (
+                            fb_data.get("orderList", [])
+                            if isinstance(fb_data, dict)
+                            else (fb_data if isinstance(fb_data, list) else [])
+                        )
+                        if fb_list:
+                            fallback_products = fb_list[0].get("orderProducts") or []
+                except Exception as e:
+                    logger.warning(
+                        f"[cron-b] {row['platform_order_no']} 明细回退回查异常: {e}"
+                    )
+                if fallback_products:
+                    # 写回快照，同单二次回传不再回查
+                    try:
+                        conn.execute(
+                            "UPDATE order_map SET order_items_json = ?, "
+                            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (json.dumps(fallback_products, ensure_ascii=False, default=str), map_id),
+                        )
+                        conn.commit()
+                        logger.info(
+                            f"[cron-b] {row['platform_order_no']} 明细回退：回查蓝盟补得 "
+                            f"{len(fallback_products)} 条明细并写回快照"
+                        )
+                    except Exception as e:
+                        logger.warning(f"[cron-b] {row['platform_order_no']} 明细写回失败: {e}")
+                    for prod in fallback_products:
+                        oiid = prod.get("orderItemId")
+                        if not oiid:
+                            continue
+                        num = prod.get("num") or prod.get("number") or 1
+                        item = {"orderItemId": int(oiid), "num": int(num)}
+                        sku_no = prod.get("skuNo")
+                        sku_id = prod.get("skuId")
+                        if sku_no:
+                            item["skuNo"] = str(sku_no)
+                        elif sku_id:
+                            item["skuId"] = int(sku_id)
+                        items.append(item)
+                else:
+                    logger.warning(
+                        f"[cron-b] {row['platform_order_no']} 快照无明细且回查未补得，需人工处理"
+                    )
             if not items:
                 logger.warning(f"[cron-b] {row['platform_order_no']} 无有效商品明细，跳过回传")
                 st_transition(map_id, STATE_FAILED, "cron_b", "无商品明细")
