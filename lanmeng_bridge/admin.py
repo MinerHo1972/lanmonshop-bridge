@@ -8,6 +8,12 @@ from fastapi import APIRouter, Query, Request, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .auth import get_current_user, require_admin
+from .core.consistency import (
+    CONSISTENT,
+    INCONSISTENT,
+    SYNCED_BACK,
+    classify_consistency,
+)
 from .storage.db import get_connection
 
 logger = logging.getLogger(__name__)
@@ -86,6 +92,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .badge-err{background:#4d1a1a;color:#f85149}
   .badge-warn{background:#4d351a;color:#d29922}
   .badge-init{background:#1a3a4d;color:#58a6ff}
+  .badge-sync{background:#1a2f4d;color:#79c0ff}
   .code{font-family:'SF Mono','Cascadia Code',monospace;font-size:11px;color:#7ee787;max-width:300px;overflow:hidden;text-overflow:ellipsis}
   .filters{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
   .filters select,.filters input{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 10px;border-radius:4px;font-size:12px}
@@ -164,6 +171,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <select id="recon-filter" style="background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:4px 10px;border-radius:4px;font-size:12px">
         <option value="all">全部状态</option>
         <option value="consistent">✅ 一致</option>
+        <option value="synced_back">🔵 已回传</option>
         <option value="inconsistent">❌ 不一致</option>
         <option value="undelivered">📤 未递交</option>
       </select>
@@ -243,6 +251,12 @@ function stateBadge(s){
 function unifiedBadge(label){
   const clss={'待发货':'badge-init','部分发货':'badge-warn','已发货':'badge-ok','已完成':'badge-ok','已取消/退款':'badge-err'};
   return'<span class="badge '+(clss[label]||'badge-warn')+'">'+(label||'?')+'</span>'
+}
+function consistencyBadge(c){
+  // 三端一致性三值：一致 / 已回传(蓝盟由对方维护，正常) / 不一致
+  if(c==='consistent')return'<span class="badge badge-ok">一致</span>';
+  if(c==='synced_back')return'<span class="badge badge-sync" title="DB/JKY 已完成，蓝盟侧状态由对方维护，属正常状态">已回传</span>';
+  return'<span class="badge badge-err">不一致</span>'
 }
 function stateLabelBadge(label, raw){
   // 根据原始值决定颜色: 取消/异常/失败 = 红色, 初始/待处理 = 黄色, done/ok = 绿色
@@ -337,28 +351,32 @@ async function loadRecon(page){
     const r=await(await apiFetch('/admin/api/reconciliation?page='+reconPage+'&page_size=50')).json();
     const filter=document.getElementById('recon-filter').value;
     let orders=r.orders;
-    if(filter==='consistent')orders=orders.filter(o=>o.consistent);
-    else if(filter==='inconsistent')orders=orders.filter(o=>!o.consistent);
+    // 一致性三值过滤：consistent / synced_back(已回传) / inconsistent
+    if(filter==='consistent')orders=orders.filter(o=>o.consistency==='consistent');
+    else if(filter==='synced_back')orders=orders.filter(o=>o.consistency==='synced_back');
+    else if(filter==='inconsistent')orders=orders.filter(o=>o.consistency==='inconsistent');
     else if(filter==='undelivered')orders=orders.filter(o=>o.state==='init'||o.state==='failed'||o.state==='skipped');
     reconData=r.orders;
     // 五态统计 (以 bridge_unified 为准)
     const FIVE_STATES=['待发货','部分发货','已发货','已完成','已取消/退款'];
     const counts={};let total=r.orders.length;
     FIVE_STATES.forEach(s=>counts[s]={total:0,consistent:0,inconsistent:0});
-    let consistentCount=0,inconsistentCount=0;
+    let consistentCount=0,inconsistentCount=0,syncedBackCount=0;
     r.orders.forEach(o=>{
       const s=o.bridge_unified||'待发货';
       if(!counts[s])counts[s]={total:0,consistent:0,inconsistent:0};
       counts[s].total++;
-      if(o.consistent){counts[s].consistent++;consistentCount++}
+      if(o.consistency==='consistent'){counts[s].consistent++;consistentCount++}
+      else if(o.consistency==='synced_back'){syncedBackCount++}
       else{counts[s].inconsistent++;inconsistentCount++}
     });
     document.getElementById('recon-stats').innerHTML=
       '<div class="stat-card"><div class="num">'+r.total+'</div><div class="label">订单总数</div></div>'+
       FIVE_STATES.map(s=>'<div class="stat-card"><div class="num '+(counts[s]?.inconsistent>0?'red':'')+'">'+(counts[s]?.total||0)+
         '</div><div class="label">'+s+'</div></div>').join('')+
-      '<div class="stat-card"><div class="num">'+consistentCount+'</div><div class="label">一致</div></div>'+
-      '<div class="stat-card"><div class="num '+(inconsistentCount>0?'red':'')+'">'+inconsistentCount+'</div><div class="label">不一致</div></div>'+
+      '<div class="stat-card"><div class="num">'+consistentCount+'</div><div class="label">✅ 一致</div></div>'+
+      '<div class="stat-card"><div class="num" style="color:#79c0ff">'+syncedBackCount+'</div><div class="label">🔵 已回传</div></div>'+
+      '<div class="stat-card"><div class="num '+(inconsistentCount>0?'red':'')+'">'+inconsistentCount+'</div><div class="label">❌ 不一致</div></div>'+
       '<div class="stat-card"><div class="num">'+orders.length+'</div><div class="label">本页</div></div>';
     // rows — 用筛选后的 orders
     document.getElementById('recon-rows').innerHTML=orders.map((o,i)=>'<tr id="recon-tr-'+o.id+'" onclick="toggleRow('+o.id+')">'+
@@ -368,9 +386,7 @@ async function loadRecon(page){
       '<td>'+unifiedBadge(o.platform_unified)+'</td>'+
       '<td>'+unifiedBadge(o.bridge_unified)+'</td>'+
       '<td>'+unifiedBadge(o.jky_unified)+'</td>'+
-      '<td>'+(o.consistent
-        ?'<span class="badge badge-ok">一致</span>'
-        :'<span class="badge badge-err">不一致</span>')+'</td>'+
+      '<td>'+consistencyBadge(o.consistency)+'</td>'+
       '<td class="code">'+(o.jky_trade_no||'-')+'</td>'+
       '<td class="code">'+(o.logistic_no||'-')+'</td>'+
       '<td class="ttl" style="max-width:180px;overflow:hidden;text-overflow:ellipsis">'+(o.last_error||'')+'</td>'+
@@ -937,6 +953,25 @@ async def api_reconciliation(request: Request, page: int = 1, page_size: int = 5
         flags, priority = _classify_drift(row_dict)
         # 推荐操作
         suggested = _suggest_action(r["state"], actual_lanmong, r["jky_trade_no"], r["logistic_no"])
+
+        # 统一态三端视图（各列展示用，含 fallback）
+        platform_unified_v = r["platform_unified"] or _lanmong_label(r["platform_state"])
+        bridge_unified_v = r["bridge_unified"] or _bridge_label(r["state"])
+        # jky_unified 空值 fallback: 未创单(无 jky_trade_no) → "未创建"，不能用 "待发货" 兜底
+        # (2026-08-10 修复: 原 `or "待发货"` 让 failed/init 订单 JKY 列显示假"待发货"，误导三端一致性判断)
+        jky_unified_v = (
+            r["jky_effective_unified"] or r["jky_unified"]
+            or _jky_label(r["state"], r["jky_trade_no"], r["logistic_no"])
+        )
+
+        # 三端一致性三值判定（2026-08-17）：
+        # consistent（三端严格一致）/ synced_back（已回传：DB/JKY 已完成、蓝盟由对方
+        # 维护停留在已发货/已完成，属正常状态）/ inconsistent（真异常）。
+        # 旧版三态严格相等会把 cron-b 已回传、蓝盟长尾停在"已发货"的订单大量误标"不一致"。
+        consistency = classify_consistency(
+            platform_unified_v, bridge_unified_v, jky_unified_v, actual_lanmong,
+        )
+
         entry = {
             "id": r["id"],
             "platform_order_no": r["platform_order_no"],
@@ -953,18 +988,12 @@ async def api_reconciliation(request: Request, page: int = 1, page_size: int = 5
             "last_alert_time": r["last_alert_time"] or "",
             "last_alert_message": r["last_alert_message"] or "",
             # 统一态字段
-            "platform_unified": r["platform_unified"] or _lanmong_label(r["platform_state"]),
-            "bridge_unified": r["bridge_unified"] or _bridge_label(r["state"]),
-            # jky_unified 空值 fallback: 未创单(无 jky_trade_no) → "未创建"，不能用 "待发货" 兜底
-            # (2026-08-10 修复: 原 `or "待发货"` 让 failed/init 订单 JKY 列显示假"待发货"，误导三端一致性判断)
-            "jky_unified": r["jky_effective_unified"] or r["jky_unified"]
-            or _jky_label(r["state"], r["jky_trade_no"], r["logistic_no"]),
-            "consistent": (
-                (r["platform_unified"] or _lanmong_label(r["platform_state"]))
-                == (r["bridge_unified"] or _bridge_label(r["state"]))
-                == (r["jky_effective_unified"] or r["jky_unified"]
-                    or _jky_label(r["state"], r["jky_trade_no"], r["logistic_no"]))
-            ),
+            "platform_unified": platform_unified_v,
+            "bridge_unified": bridge_unified_v,
+            "jky_unified": jky_unified_v,
+            "consistency": consistency,
+            # 兼容旧前端/旧字段语义：synced_back 视为正常态（不算"不一致"）
+            "consistent": consistency != INCONSISTENT,
         }
         orders.append(entry)
         if priority == "terminal":
@@ -973,6 +1002,11 @@ async def api_reconciliation(request: Request, page: int = 1, page_size: int = 5
             summary["pending"] += 1
             if "lanmeng_cancel" in flags or "failed" in flags:
                 summary["inconsistent"] += 1
+
+    # 一致性三值汇总（本页）：consistent / synced_back / inconsistent
+    summary["consistent"] = sum(1 for o in orders if o["consistency"] == CONSISTENT)
+    summary["synced_back"] = sum(1 for o in orders if o["consistency"] == SYNCED_BACK)
+    summary["inconsistent_unified"] = sum(1 for o in orders if o["consistency"] == INCONSISTENT)
 
     return {
         "total": total,

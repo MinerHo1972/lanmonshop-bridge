@@ -285,6 +285,8 @@ def _build_report(
     # 蓝盟 → DB 匹配情况
     lanmong_matched = 0
     lanmong_unmatched = 0
+    # 「已回传」正常态计数：DB done + 蓝盟停在 已发货(4)/已完成(6)（2026-08-17）
+    synced_back = 0
 
     # 每日趋势 (date → counts)
     daily = defaultdict(lambda: {"lanmong": 0, "db": 0, "jky_created": 0, "done": 0})
@@ -352,7 +354,13 @@ def _build_report(
             continue
 
         # 2. DB done 但蓝盟未发货
-        if db_state == "done" and lanmong_state != 4:
+        # (2026-08-17 修复) cron-b 完成 JKY 发货回传后 DB 闭环 done、JKY=已完成，
+        # 蓝盟后台状态由蓝盟方自行维护和更新，通常停留在「已发货(4)」或更新到
+        # 「已完成(6)」——这属于正常的「已回传」状态，不算偏差。
+        # 只有蓝盟仍停在 1(待审核)/2(待发货)/3(部分发货) 或已取消/退款时才算偏差。
+        if db_state == "done" and lanmong_state in (4, 6):
+            synced_back += 1
+        elif db_state == "done" and lanmong_state not in (4, 6):
             deviations.append({
                 "order_no": order_no,
                 "db_state": db_state,
@@ -438,6 +446,7 @@ def _build_report(
         "lanmong_total": len(lanmong_orders),
         "lanmong_matched": lanmong_matched,
         "lanmong_unmatched": lanmong_unmatched,
+        "synced_back": synced_back,
         "db_total": len(db_orders),
         "jky_created": jky_success,
         "jky_shipped": jky_shipped,
@@ -469,6 +478,7 @@ def _format_feishu_report(report: dict) -> str:
         f"JKY 已创单: {s['jky_created']}",
         f"JKY 已发货/回传: {s['jky_shipped']}",
         f"已闭环(done): {s['done']}",
+        f"其中已回传(蓝盟侧待对方更新,正常): {s.get('synced_back', 0)}",
         f"待处理: {s['pending']}",
         "",
     ]
