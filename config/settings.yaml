@@ -41,3 +41,6 @@ retry:
 
 # 自动过审开关（默认开启）
 auto_review: true
+
+# api_call_log 保留天数（cron-f 每日 03:30 清理，2026-08-19 由 14 调整为 7）
+api_log_retention_days: 7
