@@ -460,6 +460,23 @@ def close_all():
     _connections.clear()
 
 
+# 单次 API 调用的请求/响应体最大留存长度（字符）。
+# 2026-09-20：/jky/trade/list 与 oms.trade.fullinfoget.customized 的全量响应约
+# 100-130KB/条，高频调用使 api_call_log 日增约 350MB。admin 展示只取前 800 字符，
+# 故超长部分截断留存（保留头部 + 标注原始长度，便于判断是否被截）。
+_API_BODY_MAX_CHARS = 4096
+
+
+def _truncate_body(body: str, limit: int = _API_BODY_MAX_CHARS) -> str:
+    """截断过长的请求/响应体，避免日志表被大响应撑爆。
+
+    未超限原样返回；超限返回「前 limit 字符 + 截断标记（含原始长度）」。
+    """
+    if not body or len(body) <= limit:
+        return body
+    return body[:limit] + f"...[truncated, original_len={len(body)}]"
+
+
 def log_api_call(
     source: str,
     method: str,
@@ -471,7 +488,16 @@ def log_api_call(
     error: str = "",
     duration_ms: int = 0,
 ) -> None:
-    """写入 API 调用日志到 api_call_log 表"""
+    """写入 API 调用日志到 api_call_log 表
+
+    ⚠️ 请求/响应体超过 _API_BODY_MAX_CHARS 会被截断（2026-09-20）。
+    背景：/jky/trade/list 与 oms.trade.fullinfoget.customized 的全量响应约
+    100-130KB/条，高频调用使 api_call_log 每天增长约 350MB（7 天保留期稳态 2.5GB）。
+    admin 界面只读取前 800 字符（admin.py substr(response_body,1,800)），
+    超长部分无使用价值，故入库前截断。
+    """
+    request_body = _truncate_body(request_body)
+    response_body = _truncate_body(response_body)
     try:
         conn = get_connection()
         conn.execute(
