@@ -298,7 +298,7 @@ _MIGRATIONS = [
     "ALTER TABLE order_map ADD COLUMN last_alert_time TEXT DEFAULT ''",
     "ALTER TABLE order_map ADD COLUMN last_alert_message TEXT DEFAULT ''",
     # 🆕 admin: sessions 加 role 缓存列（减少每次 API 调用的 DB 开销）
-    "ALTER TABLE sessions ADD COLUMN role TEXT DEFAULT '',"
+    "ALTER TABLE sessions ADD COLUMN role TEXT DEFAULT ''",
     # 🆕 isFit: sku_mapping 组合装标志（2026-07-22）
     "ALTER TABLE sku_mapping ADD COLUMN is_fit INTEGER DEFAULT 0",
 ]
