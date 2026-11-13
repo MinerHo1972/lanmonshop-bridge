@@ -198,6 +198,8 @@ CREATE INDEX IF NOT EXISTS idx_order_merge_source ON order_merge(source_trade_no
 CREATE INDEX IF NOT EXISTS idx_order_merge_target ON order_merge(target_trade_no);
 
 -- 物流同步任务
+-- ⚠️ DEPRECATED: express_sync / express_sync_items 保留仅为兼容旧库，代码从不写入。
+-- 物流回传的真实结果落在 order_map.logistic_no 与 order_status_log，查问题别拿这两张空表当故障。
 CREATE TABLE IF NOT EXISTS express_sync (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   platform_order_no TEXT NOT NULL,
