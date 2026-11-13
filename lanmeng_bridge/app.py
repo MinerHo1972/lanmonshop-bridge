@@ -10,6 +10,8 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+import asyncio
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse
@@ -25,7 +27,7 @@ from .cron import cron_a, cron_b, cron_c, cron_f
 from .admin import router as admin_router
 from .auth import router as auth_router
 from .notify.feishu import FeishuNotifier
-from .storage.db import init_db, close_all, get_connection
+from .storage.db import init_db, close_all, get_connection, truncate_wal
 
 # ---------- 日志 ----------
 
@@ -107,6 +109,25 @@ async def _run_cron_f():
                 logger.exception("[cron-f] 告警发送也失败")
 
 
+async def _run_cron_g():
+    """低峰 WAL 截断：把 WAL 收缩回 journal_size_limit 以内。
+
+    为什么要单独一个 job：PRAGMA journal_size_limit 只能让 checkpoint 之后截断，
+    而长期运行的连接会一直持有 WAL 句柄；每天低峰主动 checkpoint(TRUNCATE) 一次，
+    避免 WAL 又涨回 GB 级（2026-11-13 线上查到 2.6G / 主库 102M）。
+    有读事务持快照时返回 busy=1，不阻塞、不报错，第二天再来。
+    """
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(None, truncate_wal)
+        if result["busy"]:
+            logger.warning(f"[cron-g] WAL 截断遇到忙（有读事务），本次跳过: {result}")
+        else:
+            logger.info(f"[cron-g] WAL 已截断: checkpointed={result['checkpointed_pages']} pages")
+    except Exception as e:
+        logger.exception(f"[cron-g] WAL 截断异常（非致命）: {e}")
+
+
+
 # ---------- 生命周期 ----------
 
 
@@ -175,6 +196,14 @@ async def lifespan(app: FastAPI):
         id="cron_f", replace_existing=True,
         **common_kwargs,
     )
+    # cron-g: 每天 04:10 低峰截断 WAL（cron-f 之后半小时，业务几乎没流量）
+    g_hour = cron_cfg.get("g_hour", 4)
+    g_minute = cron_cfg.get("g_minute", 10)
+    scheduler.add_job(
+        _run_cron_g, "cron", hour=g_hour, minute=g_minute,
+        id="cron_g", replace_existing=True,
+        **common_kwargs,
+    )
 
     # 将 app.state 赋值为实例化后的客户端（模块级赋值在 lifespan 开始时还是 None）
     app.state.lanmong_client = lanmong_client
@@ -189,7 +218,7 @@ async def lifespan(app: FastAPI):
         f"cron-a({a_interval}min), "
         f"cron-b({b_interval}min), "
         f"cron-c({c_interval}min), "
-        f"cron-f(每天 {f_hour:02d}:{f_minute:02d})"
+        f"cron-f(每天 {f_hour:02d}:{f_minute:02d}), cron-g(WAL 截断 每天 {g_hour:02d}:{g_minute:02d})"
     )
 
     yield  # 应用运行中

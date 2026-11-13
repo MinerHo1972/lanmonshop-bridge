@@ -434,8 +434,23 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=5000;")
         conn.execute("PRAGMA foreign_keys=ON;")
+        # WAL 文件上限 64MB：PRAGMA 默认 -1 表示 checkpoint 后也不截断 WAL，
+        # 长期运行会把 WAL 涨到 GB 级（2026-11-13 线上查到 2.6G / 主库 102M）。
+        # 设上限后，每次 checkpoint 会把 WAL 收缩回该大小以内。
+        conn.execute("PRAGMA journal_size_limit=67108864;")
         _connections[path] = conn
     return _connections[path]
+
+
+def truncate_wal(db_path: Optional[str] = None) -> dict:
+    """把 WAL 截断回 journal_size_limit 以内（低峰调用）。
+
+    checkpoint 本身是幂等且安全的：有读事务持快照时返回 busy 而不是阻塞。
+    返回 {busy, log_pages, checkpointed_pages}，busy=1 表示这次没做完，下次再来。
+    """
+    conn = get_connection(db_path)
+    busy, log_pages, done = conn.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
+    return {"busy": busy, "log_pages": log_pages, "checkpointed_pages": done}
 
 
 def init_db(db_path: Optional[str] = None):
