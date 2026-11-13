@@ -28,6 +28,7 @@ cron:
   c_interval_minutes: 15     # 中台退 → 吉客云取消
   f_hour: 3                  # 三方对账
   f_minute: 30
+  f_feishu_push: false       # 日报飞书推送开关（2026-11-13 用户裁决停推；对账/统一态刷新/日志清理不受影响）
 
 # 飞书告警
 feishu:

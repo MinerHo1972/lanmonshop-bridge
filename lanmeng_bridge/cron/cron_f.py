@@ -688,9 +688,19 @@ async def run_cron_f(
     )
     conn.commit()
 
-    # ---- 6. 推飞书 ----
-    msg = _format_feishu_report(report)
-    await notifier._send(msg)
+    # ---- 6. 推飞书（可由 cron.f_feishu_push=false 关闭日报推送；2026-11-13 用户裁决停推日报）----
+    # 注意: load_settings 在本函数后段才 inline import（同函数内 import 会让该名在全程成为局部变量
+    # → UnboundLocalError），此处必须用独立别名，不可直接引 load_settings。
+    from ..config import load_settings as _load_settings_push
+    try:
+        push_daily = bool((_load_settings_push().get("cron") or {}).get("f_feishu_push", True))
+    except Exception:
+        push_daily = True  # 配置读取失败时保持原行为，不静默吞掉日报
+    if push_daily:
+        msg = _format_feishu_report(report)
+        await notifier._send(msg)
+    else:
+        logger.info("[cron-f] 飞书日报推送已关闭 (cron.f_feishu_push=false)，本次仅落库")
 
     # ---- 7. api_call_log retention 清理（保留 api_log_retention_days 天，默认 14，2026-08-15）----
     # 根因: fullinfoget/trade.list 响应全文入库 ~100KB/行，无清理时月增 3G+（生产实测 3.4G）
