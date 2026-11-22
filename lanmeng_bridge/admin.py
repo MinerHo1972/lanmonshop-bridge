@@ -65,7 +65,7 @@ def record_admin_alert(conn, notifier, order_id: int,
     )
     conn.commit()
 
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
