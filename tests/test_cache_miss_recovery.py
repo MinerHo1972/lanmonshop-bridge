@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 
 # 项目根
-ROOT = Path("/home/lhs_admin/projects/lanmonshop-bridge")
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 # 临时 DB

@@ -12,7 +12,7 @@ import tempfile
 import os
 from pathlib import Path
 
-ROOT = Path("/home/lhs_admin/projects/lanmonshop-bridge")
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 tmp_db = tempfile.mktemp(suffix=".db")
