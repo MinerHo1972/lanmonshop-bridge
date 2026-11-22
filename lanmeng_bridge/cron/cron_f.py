@@ -285,6 +285,9 @@ def _build_report(
     # 蓝盟 → DB 匹配情况
     lanmong_matched = 0
     lanmong_unmatched = 0
+    # 蓝盟已取消且从未进 DB 的单（创建后几秒内取消，cron-a 见 state=-2 直接跳过）：
+    # 不需要发货也不需要补单，不计"未追踪"、不报偏差，只单独计数（2026-11-22 何明确认过滤）
+    lanmong_cancelled = 0
     # 「已回传」正常态计数：DB done + 蓝盟停在 已发货(4)/已完成(6)（2026-08-17）
     synced_back = 0
 
@@ -306,6 +309,12 @@ def _build_report(
 
         db_row = db_by_order_no.get(order_no)
         if not db_row:
+            # 蓝盟已取消的单（典型是创建后几秒内取消）：cron-a 拉到时就已是 -2，
+            # 直接跳过、从未进 order_map，也从未在吉客云创单。这类单无需发货/补单，
+            # 不算漏单、不报偏差（2026-11-22）。
+            if lanmong_state in (-2, -3, -4):
+                lanmong_cancelled += 1
+                continue
             lanmong_unmatched += 1
             # 蓝盟有但 DB 没有 → 新订单或拉取窗口偏差
             deviations.append({
@@ -446,6 +455,7 @@ def _build_report(
         "lanmong_total": len(lanmong_orders),
         "lanmong_matched": lanmong_matched,
         "lanmong_unmatched": lanmong_unmatched,
+        "lanmong_cancelled": lanmong_cancelled,
         "synced_back": synced_back,
         "db_total": len(db_orders),
         "jky_created": jky_success,
@@ -474,6 +484,7 @@ def _format_feishu_report(report: dict) -> str:
         f"蓝盟近30日订单: {s['lanmong_total']}",
         f"  其中 DB 已追踪: {s['lanmong_matched']}",
         f"  DB 未追踪(新单): {s['lanmong_unmatched']}",
+        *([f"  其中已取消未同步(忽略): {s['lanmong_cancelled']}"] if s.get("lanmong_cancelled") else []),
         f"DB 追踪中: {s['db_total']}",
         f"JKY 已创单: {s['jky_created']}",
         f"JKY 已发货/回传: {s['jky_shipped']}",
