@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Syntax check
+        run: python -m compileall -q lanmeng_bridge
+
+      - name: Unit tests (pytest)
+        run: python -m pytest -q tests/test_consistency.py tests/test_cache_miss_recovery.py
+
+      - name: Script tests
+        run: |
+          PYTHONPATH=. python tests/test_state_machine_atomic.py
+          PYTHONPATH=. python tests/test_cron_b_fallback.py
